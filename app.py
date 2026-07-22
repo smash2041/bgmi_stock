@@ -1,4 +1,4 @@
-# app.py - SINGLE FILE MERGED - POLLING 24/7 UPTIMEROBOT (NO GUNICORN)
+# app.py - SINGLE FILE MERGED - POLLING 24/7 - ONLY INLINE BUTTONS - NO COLOUR TYPE
 # Requirements: pip install Flask python-telegram-bot>=21.4 supabase python-dotenv
 # ENV: BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY (service_role), OWNER_ID
 # Start: python app.py
@@ -18,11 +18,9 @@ OWNER_ID = str(os.getenv("OWNER_ID", "")).strip()
 if not BOT_TOKEN or not SUPABASE_URL or not SUPABASE_KEY or not OWNER_ID:
     print("WARNING: ENV missing!")
 
-# Supabase Client (merged)
 from supabase import create_client
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Telegram Imports
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton, CopyTextButton
@@ -34,22 +32,18 @@ from telegram.ext import (
 
 app = Flask(__name__)
 
-# ---------- Helpers ----------
 def clean_button_text(text: str) -> str:
     if not text: return ""
     t = text.strip()
-    # Remove emoji/lock if present for matching
     t = re.sub(r'[^\w\s\-\_\.\(\)\[\]\{\}]+', '', t, flags=re.UNICODE).strip()
     return t
 
 def is_owner(uid): return str(uid) == OWNER_ID
-
 def is_co_admin(uid):
     try:
         r = supabase.table("co_admins").select("user_id").eq("user_id", int(uid)).execute()
         return len(r.data) > 0
     except: return False
-
 def is_authorized(uid):
     if is_owner(uid): return True
     if is_co_admin(uid): return True
@@ -81,7 +75,6 @@ def generate_key():
     rand = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
     return f"KEY-{rand}"
 
-# ---------- Auto Delete ----------
 async def auto_delete_message(bot, chat_id, message_id, delay=15):
     await asyncio.sleep(delay)
     try: await bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -90,22 +83,11 @@ async def auto_delete_message(bot, chat_id, message_id, delay=15):
 def schedule_delete(bot, chat_id, message_id):
     asyncio.create_task(auto_delete_message(bot, chat_id, message_id, 15))
 
-# ---------- Button Rendering Logic (COLOURFUL) ----------
+# ---------- CHANGED: Only callback normal, no colour copy/url ----------
 def build_inline_button(btn):
-    name = btn['name'] # ONLY admin name, no emoji/number
-    btype = (btn.get('btn_type') or 'callback').lower()
-    try:
-        if btype == 'copy' and btn.get('copy_value'):
-            return InlineKeyboardButton(text=name, copy_text=CopyTextButton(text=btn['copy_value']))
-        elif btype == 'url' and btn.get('url'):
-            return InlineKeyboardButton(text=name, url=btn['url'])
-        else:
-            return InlineKeyboardButton(text=name, callback_data=f"view_btn:{btn['id']}:0")
-    except Exception as e:
-        print(f"CopyTextButton fallback: {e}")
-        if btype == 'url' and btn.get('url'):
-            return InlineKeyboardButton(text=name, url=btn['url'])
-        return InlineKeyboardButton(text=name, callback_data=f"view_btn:{btn['id']}:0")
+    name = btn['name']
+    # Force only normal callback, colour system removed
+    return InlineKeyboardButton(text=name, callback_data=f"view_btn:{btn['id']}:0")
 
 PER_PAGE = 15
 
@@ -133,7 +115,6 @@ def get_all_buttons_for_manage(show_all=False):
         return q.execute().data
     except: return []
 
-# ---------- Core Send Functions ----------
 async def send_button_files(update, context, button):
     chat_id = update.effective_chat.id
     try:
@@ -171,27 +152,13 @@ async def send_button_files(update, context, button):
     except Exception as e:
         await context.bot.send_message(chat_id, f"Error: {e}")
 
+# ---------- CHANGED: No ReplyKeyboard, only Inline on top ----------
 async def show_main_menu(update, context, page=0):
     uid = update.effective_user.id
     show_owner = is_owner(uid)
     buttons, total = get_buttons_paginated(page, show_owner_only=show_owner)
     total_pages = max(1, (total + PER_PAGE - 1)//PER_PAGE)
-    reply_rows = []
-    row = []
-    for b in buttons:
-        row.append(b['name'])
-        if len(row)==2:
-            reply_rows.append(row); row=[]
-    if row: reply_rows.append(row)
-    nav = []
-    if page>0: nav.append("⬅ Prev Page")
-    if page < total_pages-1: nav.append("Next Page ➡")
-    if nav: reply_rows.append(nav)
-    if is_owner(uid) or is_co_admin(uid):
-        reply_rows.append(["🛠 Admin Panel"])
-    else:
-        reply_rows.append(["🏠 Main Menu"])
-    reply_kb = ReplyKeyboardMarkup(reply_rows, resize_keyboard=True)
+
     inline_rows = []
     r = []
     for b in buttons:
@@ -199,19 +166,22 @@ async def show_main_menu(update, context, page=0):
         if len(r)==2:
             inline_rows.append(r); r=[]
     if r: inline_rows.append(r)
+
     pag_row = []
     if page>0: pag_row.append(InlineKeyboardButton("⬅ Prev", callback_data=f"main_page:{page-1}"))
     if page < total_pages-1: pag_row.append(InlineKeyboardButton("Next ➡", callback_data=f"main_page:{page+1}"))
     if pag_row: inline_rows.append(pag_row)
+
+    if is_owner(uid) or is_co_admin(uid):
+        inline_rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel")])
+
     context.user_data['main_page'] = page
     text = f"📂 Main Menu (Page {page+1}/{total_pages}) - {total} buttons\nSelect any button:"
     try:
         if update.callback_query:
             await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(inline_rows))
             await update.callback_query.answer()
-            await context.bot.send_message(update.effective_chat.id, "⌨ Keyboard updated", reply_markup=reply_kb)
         else:
-            await context.bot.send_message(update.effective_chat.id, "⌨ Menu", reply_markup=reply_kb)
             await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(inline_rows))
     except Exception as e:
         print(e)
@@ -238,7 +208,13 @@ async def show_admin_panel(update, context):
             [InlineKeyboardButton("🗂 Manage Buttons", callback_data="admin_manage_list")],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="main_page:0")],
         ]
-    await update.effective_message.reply_text("🛠 Admin Panel", reply_markup=InlineKeyboardMarkup(kb))
+    try:
+        if update.callback_query:
+            await update.callback_query.edit_message_text("🛠 Admin Panel", reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await update.effective_message.reply_text("🛠 Admin Panel", reply_markup=InlineKeyboardMarkup(kb))
+    except:
+        await update.effective_message.reply_text("🛠 Admin Panel", reply_markup=InlineKeyboardMarkup(kb))
 
 # ---------- Handlers ----------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -248,14 +224,13 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update, context, 0)
     else:
         set_user_state(uid, "awaiting_access_key", {})
-        await update.effective_message.reply_text(
-            "🔐 Welcome! Please send your Access Key to continue.\nFormat: KEY-XXXXXXXX\nContact owner for key."
-        )
+        await update.effective_message.reply_text("🔐 Welcome! Please send your Access Key to continue.\nFormat: KEY-XXXXXXXX\nContact owner for key.")
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data
     uid = update.effective_user.id
+
     if data.startswith("view_btn:"):
         _, bid, page = data.split(":")
         try:
@@ -269,9 +244,37 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_button_files(update, context, btn)
         except Exception as e:
             await q.answer(f"Error {e}")
+
     elif data.startswith("main_page:"):
         page = int(data.split(":")[1])
         await show_main_menu(update, context, page)
+
+    # CHANGED: Visibility via Inline
+    elif data.startswith("vis_"):
+        st = get_user_state(uid)
+        if not st or st['state']!="awaiting_new_button_vis":
+            await q.answer(); return
+        sdata = st['data']
+        vis = "all" if data=="vis_public" else "owner_only"
+        try:
+            ins = {
+                "name": sdata['name'],
+                "visibility": vis,
+                "btn_type": "callback",
+                "color": "",
+                "emoji": ""
+            }
+            supabase.table("buttons").insert(ins).execute()
+            await q.edit_message_text(f"✅ Button '{sdata['name']}' created! (Normal callback)")
+        except Exception as e:
+            if "unique" in str(e).lower():
+                await q.edit_message_text("❌ Button name already exists! Try different name.")
+            else:
+                await q.edit_message_text(f"Error: {e}")
+        clear_user_state(uid)
+        await q.answer()
+        await show_main_menu(update, context, 0)
+
     elif data.startswith("admin_"):
         if not (is_owner(uid) or is_co_admin(uid)):
             await q.answer("Admin only"); return
@@ -291,7 +294,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
         elif data=="admin_add_button":
             set_user_state(uid, "awaiting_new_button_name", {})
-            await q.edit_message_text("📝 Send new button NAME (exact name that will show, no emoji auto):")
+            await q.edit_message_text("📝 Send new button NAME (exact name that will show):")
         elif data=="admin_manage_list":
             show_all = is_owner(uid)
             btns = get_all_buttons_for_manage(show_all)
@@ -314,38 +317,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for c in res.data: txt += f"ID: {c['user_id']} added by {c['added_by']}\n"
             await q.edit_message_text(txt or "None", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
         elif data=="admin_panel":
-            await q.edit_message_text("🛠 Admin Panel", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔑 Generate New Key", callback_data="admin_gen_key")],
-                [InlineKeyboardButton("📋 List Keys", callback_data="admin_list_keys")],
-                [InlineKeyboardButton("➕ Add New Button", callback_data="admin_add_button")],
-                [InlineKeyboardButton("🗂 Manage Buttons", callback_data="admin_manage_list")],
-                [InlineKeyboardButton("👥 Add Co-Admin", callback_data="admin_add_coadmin")],
-                [InlineKeyboardButton("📜 List Co-Admins", callback_data="admin_list_coadmin")],
-                [InlineKeyboardButton("🏠 Main Menu", callback_data="main_page:0")],
-            ]))
+            await show_admin_panel(update, context)
         await q.answer()
+
     elif data.startswith("manage_btn:"):
         bid = int(data.split(":")[1])
+        # CHANGED: Colour button removed
         rows = [
             [InlineKeyboardButton("📤 Add Files", callback_data=f"m_addfile:{bid}")],
             [InlineKeyboardButton("📄 List/Delete Files", callback_data=f"m_listfiles:{bid}")],
-            [InlineKeyboardButton("🎨 Change Colour/Type", callback_data=f"m_editcolor:{bid}")],
             [InlineKeyboardButton("👁 Visibility", callback_data=f"m_vis:{bid}")],
             [InlineKeyboardButton("❌ Delete Button", callback_data=f"m_delbtn:{bid}")],
             [InlineKeyboardButton("Back", callback_data="admin_manage_list")],
         ]
         await q.edit_message_text(f"Manage Button ID {bid}", reply_markup=InlineKeyboardMarkup(rows))
         await q.answer()
+
     elif data.startswith("m_addfile:"):
         bid = int(data.split(":")[1])
         set_user_state(uid, "awaiting_file_upload", {"button_id": bid})
-        await q.edit_message_text(f"📤 Send ANY files (photo, video, doc, text) for button {bid}.\nSend multiple, then type ✅ Done",
+        await q.edit_message_text(f"📤 Send ANY files for button {bid}.\nSend multiple, then type ✅ Done",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="m_done_upload")]]))
         await q.answer()
+
     elif data=="m_done_upload":
         clear_user_state(uid)
         await q.edit_message_text("✅ Upload finished.")
         await q.answer()
+
     elif data.startswith("m_listfiles:"):
         bid = int(data.split(":")[1])
         res = supabase.table("button_files").select("*").eq("button_id", bid).execute()
@@ -357,6 +356,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows.append([InlineKeyboardButton(f"🗑 {f['file_type']} {f['id']}", callback_data=f"m_delfile:{f['id']}:{bid}")])
         rows.append([InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")])
         await q.edit_message_text(f"Files for {bid}:", reply_markup=InlineKeyboardMarkup(rows))
+
     elif data.startswith("m_delfile:"):
         _, fid, bid = data.split(":")
         if is_co_admin(uid) and not is_owner(uid):
@@ -365,6 +365,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         supabase.table("button_files").delete().eq("id", int(fid)).execute()
         await q.answer("Deleted")
         await q.edit_message_text("Deleted", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
+
     elif data.startswith("m_delbtn:"):
         bid = int(data.split(":")[1])
         if is_co_admin(uid) and not is_owner(uid):
@@ -373,24 +374,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         supabase.table("buttons").delete().eq("id", bid).execute()
         await q.edit_message_text("✅ Button Deleted")
         await q.answer()
-    elif data.startswith("m_editcolor:"):
-        bid = int(data.split(":")[1])
-        set_user_state(uid, "awaiting_new_button_color", {"button_id": bid, "edit": True})
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Red", callback_data="color_Red"), InlineKeyboardButton("Green", callback_data="color_Green")],
-            [InlineKeyboardButton("Blue", callback_data="color_Blue"), InlineKeyboardButton("Purple", callback_data="color_Purple")],
-            [InlineKeyboardButton("Orange", callback_data="color_Orange"), InlineKeyboardButton("Black", callback_data="color_Black")],
-        ])
-        await q.edit_message_text("Choose new color (saved in DB, button text stays same):", reply_markup=kb)
-    elif data.startswith("color_"):
-        color = data.split("_")[1]
-        st = get_user_state(uid)
-        if st and st['state']=="awaiting_new_button_color" and st['data'].get('edit'):
-            bid = st['data']['button_id']
-            supabase.table("buttons").update({"color": color}).eq("id", bid).execute()
-            clear_user_state(uid)
-            await q.edit_message_text(f"✅ Color changed to {color}")
-        await q.answer()
+
     elif data.startswith("m_vis:"):
         bid = int(data.split(":")[1])
         res = supabase.table("buttons").select("visibility").eq("id", bid).execute()
@@ -406,6 +390,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state_obj = get_user_state(uid)
     state = state_obj['state'] if state_obj else None
     sdata = state_obj['data'] if state_obj and state_obj.get('data') else {}
+
     if state == "awaiting_access_key":
         key_input = text.upper().strip()
         res = supabase.table("access_keys").select("*").eq("key", key_input).eq("is_used", False).execute()
@@ -418,78 +403,47 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.effective_message.reply_text("❌ Invalid or used key. Try again or contact owner.")
         return
+
     if not is_authorized(uid):
         set_user_state(uid, "awaiting_access_key", {})
         await update.effective_message.reply_text("🔐 Send Access Key first. Format KEY-XXXXXXXX")
         return
+
     if state == "awaiting_new_button_name":
         if not text:
             await update.effective_message.reply_text("Send valid name")
             return
         set_user_state(uid, "awaiting_new_button_vis", {"name": text})
-        kb = ReplyKeyboardMarkup([["Public (All Users)", "Owner Only"]], resize_keyboard=True, one_time_keyboard=True)
+        # CHANGED: Visibility via Inline, no ReplyKeyboard
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Public (All Users)", callback_data="vis_public")],
+            [InlineKeyboardButton("Owner Only", callback_data="vis_owner_only")]
+        ])
         await update.effective_message.reply_text("👁 Choose visibility:", reply_markup=kb)
         return
+
+    # CHANGED: Direct create normal callback button, no type/color ask
     if state == "awaiting_new_button_vis":
-        vis = "all" if "Public" in text else "owner_only"
-        sdata['visibility'] = vis
-        set_user_state(uid, "awaiting_new_button_type", sdata)
-        kb = ReplyKeyboardMarkup([["Copy = Green", "URL = Purple/Red", "Callback = Normal"]], resize_keyboard=True, one_time_keyboard=True)
-        await update.effective_message.reply_text("🎨 Choose button type (for colour):\nCopy = GREEN\nURL = PURPLE/RED", reply_markup=kb)
-        return
-    if state == "awaiting_new_button_type":
-        if "Copy" in text: btype="copy"
-        elif "URL" in text: btype="url"
-        else: btype="callback"
-        sdata['btn_type']=btype
-        if btype=="copy":
-            set_user_state(uid, "awaiting_new_button_copy", sdata)
-            await update.effective_message.reply_text("📋 Send COPY text (jo copy hoga):")
-        elif btype=="url":
-            set_user_state(uid, "awaiting_new_button_url", sdata)
-            await update.effective_message.reply_text("🔗 Send URL (https://...):")
-        else:
-            set_user_state(uid, "awaiting_new_button_color", sdata)
-            kb = ReplyKeyboardMarkup([["Red","Green","Blue","Purple","Orange","Black"]], resize_keyboard=True)
-            await update.effective_message.reply_text("🎨 Choose color for DB (button text will stay exact name):", reply_markup=kb)
-        return
-    if state == "awaiting_new_button_copy":
-        sdata['copy_value']=text
-        set_user_state(uid, "awaiting_new_button_color", sdata)
-        kb = ReplyKeyboardMarkup([["Red","Green","Blue","Purple","Orange","Black"]], resize_keyboard=True)
-        await update.effective_message.reply_text("🎨 Choose color:", reply_markup=kb)
-        return
-    if state == "awaiting_new_button_url":
-        sdata['url']=text
-        set_user_state(uid, "awaiting_new_button_color", sdata)
-        kb = ReplyKeyboardMarkup([["Red","Green","Blue","Purple","Orange","Black"]], resize_keyboard=True)
-        await update.effective_message.reply_text("🎨 Choose color:", reply_markup=kb)
-        return
-    if state == "awaiting_new_button_color":
-        color = text if text else "Green"
-        if sdata.get('edit'):
-            pass
-        else:
-            try:
-                ins = {
-                    "name": sdata['name'],
-                    "visibility": sdata.get('visibility','all'),
-                    "btn_type": sdata.get('btn_type','callback'),
-                    "url": sdata.get('url'),
-                    "copy_value": sdata.get('copy_value'),
-                    "color": color,
-                    "emoji": ""
-                }
-                supabase.table("buttons").insert(ins).execute()
-                await update.effective_message.reply_text(f"✅ Button '{sdata['name']}' created! Colour: {color}, Type: {sdata.get('btn_type')}")
-            except Exception as e:
-                if "unique" in str(e).lower():
-                    await update.effective_message.reply_text("❌ Button name already exists! Try different name.")
-                else:
-                    await update.effective_message.reply_text(f"Error: {e}")
+        vis = "all" if "Public" in text else "owner_only" if "Owner" in text else "all"
+        try:
+            ins = {
+                "name": sdata['name'],
+                "visibility": vis,
+                "btn_type": "callback",
+                "color": "",
+                "emoji": ""
+            }
+            supabase.table("buttons").insert(ins).execute()
+            await update.effective_message.reply_text(f"✅ Button '{sdata['name']}' created! (Normal)")
+        except Exception as e:
+            if "unique" in str(e).lower():
+                await update.effective_message.reply_text("❌ Button name already exists!")
+            else:
+                await update.effective_message.reply_text(f"Error: {e}")
         clear_user_state(uid)
         await show_main_menu(update, context, 0)
         return
+
     if state == "awaiting_coadmin_id":
         try:
             new_id = int(re.search(r'\d+', text).group())
@@ -500,6 +454,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(f"Error: {e} - send numeric ID")
         clear_user_state(uid)
         return
+
     if state == "awaiting_file_upload":
         bid = sdata.get('button_id')
         if text == "✅ Done":
@@ -538,18 +493,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 await update.effective_message.reply_text(f"Error saving: {e}")
         return
-    if text in ["⬅ Prev Page", "Next Page ➡"]:
-        page = context.user_data.get('main_page',0)
-        if "Prev" in text: page = max(0, page-1)
-        else: page+=1
-        await show_main_menu(update, context, page)
-        return
-    if text == "🛠 Admin Panel":
-        await show_admin_panel(update, context)
-        return
-    if text == "🏠 Main Menu":
-        await show_main_menu(update, context, 0)
-        return
+
+    # Old ReplyKeyboard text handlers removed, only inline remains
     if text:
         try:
             show_all = is_owner(uid)
@@ -567,8 +512,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         except Exception as e:
             print(e)
-    if update.effective_message.photo or update.effective_message.document:
-        await update.effective_message.reply_text("To add file, go to Admin Panel > Manage Buttons > Add Files")
 
 # ---------- Telegram App Setup ----------
 tg_app = Application.builder().token(BOT_TOKEN).build()
@@ -635,39 +578,3 @@ if __name__ == "__main__":
 
     loop.run_until_complete(start_polling())
     loop.run_forever()
-
-# ---------- SUPABASE SQL ----------
-"""
-create table access_keys (key text primary key, is_used bool default false, used_by bigint, created_at timestamp default now());
-create table authorized_users (user_id bigint primary key);
-create table co_admins (user_id bigint primary key, added_by bigint, added_at timestamp default now());
-create table buttons (
- id bigserial primary key,
- name text unique not null,
- visibility text default 'all' check (visibility in ('all','owner_only')),
- color text,
- emoji text default '',
- btn_type text default 'callback' check (btn_type in ('copy','url','callback')),
- url text,
- copy_value text,
- created_at timestamp default now()
-);
-create table button_files (
- id bigserial primary key,
- button_id bigint references buttons(id) on delete cascade,
- file_id text not null,
- file_unique_id text not null,
- file_type text,
- caption text,
- price text,
- country text,
- custom_data jsonb,
- created_at timestamp default now()
-);
-create table user_states (
- user_id bigint primary key,
- state text,
- data jsonb,
- updated_at timestamp default now()
-);
-"""
