@@ -1,91 +1,209 @@
-# app.py - UADMIN PARTITION + NICKNAME + ADVANCED VISIBILITY - POLLING 24/7
-import os, re, random, string, asyncio, json, uuid, threading
+# main.py - TURSO + BACKUP CHANNEL + NO FORWARD TAG - UADMIN PARTITION + NICKNAME + ADVANCED VISIBILITY - POLLING 24/7
+# Requirements: pip install Flask python-telegram-bot>=21.4 libsql-experimental python-dotenv
+# ENV: BOT_TOKEN, OWNER_ID, TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, BACKUP_CHANNEL_ID (-100...), PORT
+
+import os
+import re
+import random
+import string
+import asyncio
+import json
+import uuid
+import threading
 from datetime import datetime
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = str(os.getenv("OWNER_ID", "")).strip()
+TURSO_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
+TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+BACKUP_CHANNEL_ID = os.getenv("BACKUP_CHANNEL_ID", "").strip() # -1001234567890 private channel
 
-from supabase import create_client
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+if not BOT_TOKEN or not OWNER_ID:
+    print("WARNING: BOT_TOKEN / OWNER_ID missing!")
+if not TURSO_URL or not TURSO_TOKEN:
+    print("WARNING: TURSO URL / TOKEN missing!")
+if not BACKUP_CHANNEL_ID:
+    print("WARNING: BACKUP_CHANNEL_ID not set - backup disabled, renew fail hoga!")
 
+# ---------------- TURSO SETUP ----------------
+import libsql_experimental as libsql
+
+# Turso connect
+db = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+db.execute("PRAGMA foreign_keys = ON;")
+db.execute("PRAGMA journal_mode = WAL;")
+
+def init_db():
+    """Saare tables banata hai agar exist nahi karte"""
+    db.execute("""CREATE TABLE IF NOT EXISTS co_admins (
+        user_id INTEGER PRIMARY KEY,
+        added_by INTEGER,
+        created_at TEXT
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS user_admins (
+        user_id INTEGER PRIMARY KEY,
+        nickname TEXT,
+        created_by INTEGER,
+        created_at TEXT
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS authorized_users (
+        user_id INTEGER PRIMARY KEY,
+        created_at TEXT
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS access_keys (
+        key TEXT PRIMARY KEY,
+        is_used INTEGER DEFAULT 0,
+        used_by INTEGER,
+        nickname TEXT,
+        key_type TEXT,
+        created_at TEXT,
+        created_by INTEGER
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS user_states (
+        user_id INTEGER PRIMARY KEY,
+        state TEXT,
+        data TEXT,
+        updated_at TEXT
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS buttons (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        visibility TEXT DEFAULT 'all',
+        btn_type TEXT DEFAULT 'callback',
+        color TEXT,
+        emoji TEXT,
+        created_by INTEGER,
+        visible_to_user_id INTEGER
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS button_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        button_id INTEGER,
+        file_id TEXT,
+        file_unique_id TEXT,
+        file_type TEXT,
+        caption TEXT,
+        backup_chat_id INTEGER,
+        backup_message_id INTEGER,
+        created_at TEXT,
+        FOREIGN KEY(button_id) REFERENCES buttons(id) ON DELETE CASCADE
+    )""")
+    db.commit()
+    print("✅ Turso tables ready")
+
+init_db()
+
+# ---------------- TELEGRAM SETUP ----------------
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
 app = Flask(__name__)
 
+# ---------------- HELPER FUNCTIONS ----------------
 def clean_button_text(text: str) -> str:
-    if not text: return ""
+    if not text:
+        return ""
     t = text.strip()
     t = re.sub(r'[^\w\s\-\_\.\(\)\[\]\{\}]+', '', t, flags=re.UNICODE).strip()
     return t
 
-def is_owner(uid): return str(uid) == OWNER_ID
+def is_owner(uid):
+    return str(uid) == OWNER_ID
 
 def is_co_admin(uid):
     try:
-        r = supabase.table("co_admins").select("user_id").eq("user_id", int(uid)).execute()
-        return len(r.data) > 0
-    except: return False
+        cur = db.execute("SELECT user_id FROM co_admins WHERE user_id =?", (int(uid),))
+        return len(cur.fetchall()) > 0
+    except Exception as e:
+        print(f"is_co_admin error {e}")
+        return False
 
 def is_user_admin(uid):
     try:
-        r = supabase.table("user_admins").select("user_id").eq("user_id", int(uid)).execute()
-        return len(r.data) > 0
-    except: return False
+        cur = db.execute("SELECT user_id FROM user_admins WHERE user_id =?", (int(uid),))
+        return len(cur.fetchall()) > 0
+    except Exception as e:
+        print(f"is_user_admin error {e}")
+        return False
 
 def get_all_user_admins():
     try:
-        return supabase.table("user_admins").select("*").execute().data
-    except: return []
+        cur = db.execute("SELECT user_id, nickname, created_by, created_at FROM user_admins ORDER BY created_at DESC")
+        rows = cur.fetchall()
+        return [{"user_id": r[0], "nickname": r[1], "created_by": r[2], "created_at": r[3]} for r in rows]
+    except Exception as e:
+        print(f"get_all_user_admins error {e}")
+        return []
 
 def get_all_co_admin_ids():
     try:
-        r = supabase.table("co_admins").select("user_id").execute()
-        return [int(x['user_id']) for x in r.data]
-    except: return []
+        cur = db.execute("SELECT user_id FROM co_admins")
+        return [int(r[0]) for r in cur.fetchall()]
+    except:
+        return []
 
 def get_user_admin_ids():
     try:
         return [int(x['user_id']) for x in get_all_user_admins()]
-    except: return []
+    except:
+        return []
 
 def is_authorized(uid):
-    if is_owner(uid): return True
-    if is_co_admin(uid): return True
-    if is_user_admin(uid): return True
+    if is_owner(uid):
+        return True
+    if is_co_admin(uid):
+        return True
+    if is_user_admin(uid):
+        return True
     try:
-        r = supabase.table("authorized_users").select("user_id").eq("user_id", int(uid)).execute()
-        return len(r.data) > 0
-    except: return False
+        cur = db.execute("SELECT user_id FROM authorized_users WHERE user_id =?", (int(uid),))
+        return len(cur.fetchall()) > 0
+    except:
+        return False
 
 def get_user_role(uid):
-    if is_owner(uid): return "owner"
-    if is_co_admin(uid): return "co_admin"
-    if is_user_admin(uid): return "user_admin"
-    if is_authorized(uid): return "normal_user"
+    if is_owner(uid):
+        return "owner"
+    if is_co_admin(uid):
+        return "co_admin"
+    if is_user_admin(uid):
+        return "user_admin"
+    if is_authorized(uid):
+        return "normal_user"
     return "unauthorized"
 
 def get_user_state(uid):
     try:
-        r = supabase.table("user_states").select("*").eq("user_id", int(uid)).execute()
-        return r.data[0] if r.data else None
-    except: return None
+        cur = db.execute("SELECT state, data FROM user_states WHERE user_id =?", (int(uid),))
+        r = cur.fetchone()
+        if not r:
+            return None
+        state, data_json = r[0], r[1]
+        data = json.loads(data_json) if data_json else {}
+        return {"state": state, "data": data}
+    except Exception as e:
+        print(f"get_user_state error {e}")
+        return None
 
 def set_user_state(uid, state, data=None):
-    if data is None: data = {}
-    supabase.table("user_states").upsert({
-        "user_id": int(uid), "state": state, "data": data,
-        "updated_at": datetime.utcnow().isoformat()
-    }, on_conflict="user_id").execute()
+    if data is None:
+        data = {}
+    try:
+        db.execute("INSERT OR REPLACE INTO user_states (user_id, state, data, updated_at) VALUES (?,?,?,?)",
+                   (int(uid), state, json.dumps(data), datetime.utcnow().isoformat()))
+        db.commit()
+    except Exception as e:
+        print(f"set_user_state error {e}")
 
 def clear_user_state(uid):
-    try: supabase.table("user_states").delete().eq("user_id", int(uid)).execute()
-    except: pass
+    try:
+        db.execute("DELETE FROM user_states WHERE user_id =?", (int(uid),))
+        db.commit()
+    except:
+        pass
 
 def generate_key():
     rand = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
@@ -95,10 +213,13 @@ def generate_uadmin_key():
     rand = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
     return f"UADMIN-{rand}"
 
+# Auto delete helpers - 15 sec for files, 30 sec for upload msgs
 async def auto_delete_message(bot, chat_id, message_id, delay=15):
     await asyncio.sleep(delay)
-    try: await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except: pass
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except:
+        pass
 
 def schedule_delete(bot, chat_id, message_id):
     asyncio.create_task(auto_delete_message(bot, chat_id, message_id, 15))
@@ -110,6 +231,7 @@ def build_inline_button(btn):
     return InlineKeyboardButton(text=btn['name'], callback_data=f"view_btn:{btn['id']}:0")
 
 PER_PAGE = 15
+
 VIS_OPTIONS = [
     ("🌍 Public (All)", "all"),
     ("👑 Owner Only", "owner_only"),
@@ -120,122 +242,171 @@ VIS_OPTIONS = [
 ]
 
 def can_view_button(uid, btn, role, user_admin_ids):
-    if role == "owner": return True
+    """Main visibility logic - partition + advanced visibility"""
+    if role == "owner":
+        return True
     created_by = btn.get('created_by')
-    vis = btn.get('visibility','all')
+    vis = btn.get('visibility', 'all')
     visible_to = btn.get('visible_to_user_id')
 
-    # apna banaya hua button hamesha dikhega
+    # Apna banaya hua button hamesha dikhega
     if created_by and int(created_by) == int(uid):
         return True
 
     if role == "co_admin":
         if created_by and int(created_by) in user_admin_ids:
-            return False # user admin ka button main menu me nahi, sirf User Admin List se
-        if vis == "owner_only": return False
-        if vis.startswith("specific_uadmin"): return True # co-admin ko dikhega manage ke liye
+            return False # user admin ka button main menu me nahi, sirf User Admins List se
+        if vis == "owner_only":
+            return False
+        if str(vis).startswith("specific_uadmin"):
+            return True # co-admin ko manage ke liye dikhega
         return True
 
     if role == "user_admin":
+        # Dusre UAdmin ka private button nahi
         if created_by and int(created_by) in user_admin_ids and int(created_by)!= int(uid):
-            return False # dusre uadmin ka private button nahi
-        if vis == "all": return True
-        if vis == "uadmins_only": return True
-        if vis.startswith("specific_uadmin"):
-            if visible_to and int(visible_to) == int(uid): return True
+            return False
+        if vis == "all":
+            return True
+        if vis == "uadmins_only":
+            return True
+        if str(vis).startswith("specific_uadmin"):
+            if visible_to and int(visible_to) == int(uid):
+                return True
             return False
         return False
 
     if role == "normal_user":
         if created_by and int(created_by) in user_admin_ids:
             return False
-        if vis in ("all", "users_owner_only"): return True
+        if vis in ("all", "users_owner_only"):
+            return True
         return False
     return False
 
 def get_buttons_paginated_for_user(uid, page):
+    """Main menu ke liye filtered buttons"""
     try:
-        all_btns = supabase.table("buttons").select("*").order("name").execute().data
+        cur = db.execute("SELECT id, name, visibility, created_by, visible_to_user_id FROM buttons ORDER BY name COLLATE NOCASE")
+        all_btns = [{"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4]} for r in cur.fetchall()]
     except Exception as e:
-        print("get_buttons error", e)
+        print(f"get_buttons error {e}")
         return [], 0
     role = get_user_role(uid)
     user_admin_ids = get_user_admin_ids()
     filtered = [b for b in all_btns if can_view_button(uid, b, role, user_admin_ids)]
     total = len(filtered)
-    start = page*PER_PAGE
-    return filtered[start:start+PER_PAGE], total
+    start = page * PER_PAGE
+    return filtered[start:start + PER_PAGE], total
 
 def get_manage_buttons_for_user(uid):
+    """Manage list ke liye"""
     try:
-        all_btns = supabase.table("buttons").select("*").order("name").execute().data
-    except: return []
+        cur = db.execute("SELECT id, name, visibility, created_by, visible_to_user_id FROM buttons ORDER BY name COLLATE NOCASE")
+        all_btns = [{"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4]} for r in cur.fetchall()]
+    except:
+        return []
     role = get_user_role(uid)
     user_admin_ids = get_user_admin_ids()
-    if role == "owner": return all_btns
+    if role == "owner":
+        return all_btns
     if role == "co_admin":
         return [b for b in all_btns if not (b.get('created_by') and int(b.get('created_by')) in user_admin_ids)]
     if role == "user_admin":
         return [b for b in all_btns if b.get('created_by') and int(b.get('created_by')) == int(uid)]
     return []
 
+# ---------------- CORE FILE SENDER - NO FORWARD TAG + BACKUP FALLBACK ----------------
 async def send_button_files(update, context, button):
     chat_id = update.effective_chat.id
     uid = update.effective_user.id
     role = get_user_role(uid)
+
     if not can_view_button(uid, button, role, get_user_admin_ids()):
         msg = await context.bot.send_message(chat_id, "❌ You can't view this button")
         schedule_delete(context.bot, chat_id, msg.message_id)
         return
+
     try:
-        files_res = supabase.table("button_files").select("*").eq("button_id", button['id']).execute()
-        files = files_res.data
+        cur = db.execute("SELECT id, file_id, file_type, caption, backup_chat_id, backup_message_id FROM button_files WHERE button_id =? ORDER BY id", (button['id'],))
+        files = cur.fetchall()
         if not files:
             msg = await context.bot.send_message(chat_id, f"📭 '{button['name']}' is empty.")
             schedule_delete(context.bot, chat_id, msg.message_id)
             return
-        for f in files:
+
+        for row in files:
+            _fid, file_id, ftype, caption, b_chat, b_mid = row[0], row[1], row[2], row[3], row[4], row[5]
             try:
-                caption = (f.get('caption') or "") + "\n\n⏳ Auto-delete 15 sec..."
-                ftype = f.get('file_type','document'); fid = f.get('file_id')
-                if ftype == 'text' or not fid or fid.startswith('text_'):
-                    m = await context.bot.send_message(chat_id, text=f.get('caption') or "No content")
-                elif ftype == 'photo': m = await context.bot.send_photo(chat_id, photo=fid, caption=caption)
-                elif ftype == 'video': m = await context.bot.send_video(chat_id, video=fid, caption=caption)
-                elif ftype == 'audio': m = await context.bot.send_audio(chat_id, audio=fid, caption=caption)
-                elif ftype == 'voice': m = await context.bot.send_voice(chat_id, voice=fid, caption=caption)
-                elif ftype == 'video_note': m = await context.bot.send_video_note(chat_id, video_note=fid)
-                elif ftype == 'sticker': m = await context.bot.send_sticker(chat_id, sticker=fid)
-                else: m = await context.bot.send_document(chat_id, document=fid, caption=caption)
+                cap = (caption or "") + "\n\n⏳ Auto-delete 15 sec... Click again to view."
+                if ftype == 'text' or not file_id or file_id.startswith('text_'):
+                    m = await context.bot.send_message(chat_id, text=caption or "No content")
+                elif ftype == 'photo':
+                    m = await context.bot.send_photo(chat_id, photo=file_id, caption=cap)
+                elif ftype == 'video':
+                    m = await context.bot.send_video(chat_id, video=file_id, caption=cap)
+                elif ftype == 'audio':
+                    m = await context.bot.send_audio(chat_id, audio=file_id, caption=cap)
+                elif ftype == 'voice':
+                    m = await context.bot.send_voice(chat_id, voice=file_id, caption=cap)
+                elif ftype == 'video_note':
+                    m = await context.bot.send_video_note(chat_id, video_note=file_id)
+                elif ftype == 'sticker':
+                    m = await context.bot.send_sticker(chat_id, sticker=file_id)
+                else:
+                    m = await context.bot.send_document(chat_id, document=file_id, caption=cap)
                 schedule_delete(context.bot, chat_id, m.message_id)
+
             except Exception as e:
-                await context.bot.send_message(chat_id, f"⚠ Error: {e}")
+                # file_id expire ho gaya (purana bot delete) to backup channel se copy karo - NO FORWARD TAG
+                print(f"file_id failed {e}, trying backup copy")
+                if b_mid and b_chat and BACKUP_CHANNEL_ID:
+                    try:
+                        # copy_message se Forwarded From nahi dikhega
+                        m = await context.bot.copy_message(chat_id=chat_id, from_chat_id=int(b_chat), message_id=int(b_mid))
+                        schedule_delete(context.bot, chat_id, m.message_id)
+                    except Exception as e2:
+                        await context.bot.send_message(chat_id, f"⚠️ Backup copy failed: {e2}")
+                else:
+                    await context.bot.send_message(chat_id, "⚠️ File expired & no backup found. Owner ko re-upload karna hoga.")
+
     except Exception as e:
         await context.bot.send_message(chat_id, f"Error: {e}")
 
 async def show_main_menu(update, context, page=0):
     uid = update.effective_user.id
     buttons, total = get_buttons_paginated_for_user(uid, page)
-    total_pages = max(1, (total + PER_PAGE - 1)//PER_PAGE)
-    inline_rows = []; r=[]
+    total_pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
+    inline_rows = []
+    r = []
     for b in buttons:
         r.append(build_inline_button(b))
-        if len(r)==2: inline_rows.append(r); r=[]
-    if r: inline_rows.append(r)
-    pag_row=[]
-    if page>0: pag_row.append(InlineKeyboardButton("⬅ Prev", callback_data=f"main_page:{page-1}"))
-    if page < total_pages-1: pag_row.append(InlineKeyboardButton("Next ➡", callback_data=f"main_page:{page+1}"))
-    if pag_row: inline_rows.append(pag_row)
+        if len(r) == 2:
+            inline_rows.append(r)
+            r = []
+    if r:
+        inline_rows.append(r)
+
+    pag_row = []
+    if page > 0:
+        pag_row.append(InlineKeyboardButton("⬅ Prev", callback_data=f"main_page:{page-1}"))
+    if page < total_pages - 1:
+        pag_row.append(InlineKeyboardButton("Next ➡", callback_data=f"main_page:{page+1}"))
+    if pag_row:
+        inline_rows.append(pag_row)
+
     if is_owner(uid) or is_co_admin(uid) or is_user_admin(uid):
         inline_rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel")])
-    text = f"📂 Main Menu (Page {page+1}/{total_pages}) - {total} buttons"
+
+    text = f"📂 Main Menu (Page {page+1}/{total_pages}) - {total} buttons\nSelect any button:"
     try:
         if update.callback_query:
             await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(inline_rows))
             await update.callback_query.answer()
         else:
             await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(inline_rows))
-    except:
+    except Exception as e:
+        print(e)
         await context.bot.send_message(update.effective_chat.id, text, reply_markup=InlineKeyboardMarkup(inline_rows))
 
 async def show_admin_panel(update, context):
@@ -267,7 +438,8 @@ async def show_admin_panel(update, context):
             [InlineKeyboardButton("🏠 Main Menu", callback_data="main_page:0")],
         ]
     else:
-        await update.effective_message.reply_text("❌ Admin only"); return
+        await update.effective_message.reply_text("❌ Admin only")
+        return
     try:
         if update.callback_query:
             await update.callback_query.edit_message_text(f"🛠 Admin Panel - {role}", reply_markup=InlineKeyboardMarkup(kb))
@@ -283,7 +455,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update, context, 0)
     else:
         set_user_state(uid, "awaiting_access_key", {})
-        await update.effective_message.reply_text("🔐 Welcome! Send Access Key.\nKEY-XXXX for normal user\nUADMIN-XXXX for User Admin")
+        await update.effective_message.reply_text("🔐 Welcome! Send Access Key.\nKEY-XXXX for normal user\nUADMIN-XXXX for User Admin\nContact owner for key.")
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -292,12 +464,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = get_user_role(uid)
 
     if data.startswith("view_btn:"):
-        _, bid, page = data.split(":")
-        res = supabase.table("buttons").select("*").eq("id", int(bid)).execute()
-        if not res.data: await q.answer("Not found"); return
-        btn = res.data[0]
+        _, bid, _ = data.split(":")
+        cur = db.execute("SELECT id, name, visibility, created_by, visible_to_user_id FROM buttons WHERE id =?", (int(bid),))
+        r = cur.fetchone()
+        if not r:
+            await q.answer("Button not found")
+            return
+        btn = {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4]}
         if not can_view_button(uid, btn, role, get_user_admin_ids()):
-            await q.answer("❌ No access"); return
+            await q.answer("❌ No access")
+            return
         await q.answer()
         await send_button_files(update, context, btn)
 
@@ -305,132 +481,155 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = int(data.split(":")[1])
         await show_main_menu(update, context, page)
 
-    # ---- NEW VISIBILITY FOR NEW BUTTON ----
     elif data.startswith("vis_"):
         st = get_user_state(uid)
-        if not st or st['state']!="awaiting_new_button_vis": await q.answer(); return
+        if not st or st['state']!= "awaiting_new_button_vis":
+            await q.answer()
+            return
         sdata = st['data']
-        vis = data.replace("vis_","")
+        vis = data.replace("vis_", "")
         if vis == "specific_uadmin":
             uadmins = get_all_user_admins()
             if not uadmins:
                 await q.edit_message_text("❌ No UAdmins found. First create UAdmin.")
                 return
-            rows=[]
+            rows = []
             for ua in uadmins:
                 nick = ua.get('nickname') or f"UAdmin {ua['user_id']}"
                 rows.append([InlineKeyboardButton(f"{nick} (ID:{ua['user_id']})", callback_data=f"vis_specific_select:{ua['user_id']}")])
             rows.append([InlineKeyboardButton("Back", callback_data="admin_panel")])
             await q.edit_message_text("👤 Select UAdmin for Specific:", reply_markup=InlineKeyboardMarkup(rows))
-            await q.answer(); return
-        # normal create
+            await q.answer()
+            return
         try:
-            ins = {"name": sdata['name'], "visibility": vis, "btn_type": "callback", "color": "", "emoji": "", "created_by": int(uid), "visible_to_user_id": None}
-            supabase.table("buttons").insert(ins).execute()
+            db.execute("INSERT INTO buttons (name, visibility, btn_type, created_by) VALUES (?,?, 'callback',?)",
+                       (sdata['name'], vis, int(uid)))
+            db.commit()
             await q.edit_message_text(f"✅ Button '{sdata['name']}' created! Vis: {vis}")
         except Exception as e:
-            await q.edit_message_text(f"Error: {e}")
-        clear_user_state(uid); await q.answer()
+            if "UNIQUE" in str(e):
+                await q.edit_message_text("❌ Button name already exists! Try different name.")
+            else:
+                await q.edit_message_text(f"Error: {e}")
+        clear_user_state(uid)
+        await q.answer()
         await show_main_menu(update, context, 0)
 
     elif data.startswith("vis_specific_select:"):
         target_id = int(data.split(":")[1])
         st = get_user_state(uid)
-        if not st: return
+        if not st:
+            return
         sdata = st['data']
         try:
-            ins = {"name": sdata['name'], "visibility": "specific_uadmin", "btn_type": "callback", "color": "", "emoji": "", "created_by": int(uid), "visible_to_user_id": target_id}
-            supabase.table("buttons").insert(ins).execute()
+            db.execute("INSERT INTO buttons (name, visibility, btn_type, created_by, visible_to_user_id) VALUES (?, 'specific_uadmin', 'callback',?,?)",
+                       (sdata['name'], int(uid), target_id))
+            db.commit()
             await q.edit_message_text(f"✅ Button '{sdata['name']}' created for UAdmin {target_id}")
         except Exception as e:
             await q.edit_message_text(f"Error: {e}")
-        clear_user_state(uid); await q.answer()
+        clear_user_state(uid)
+        await q.answer()
         await show_main_menu(update, context, 0)
 
-    # ---- ADMIN PANEL ----
     elif data.startswith("admin_"):
-        if data=="admin_gen_key":
-            if not is_owner(uid): await q.answer("Owner only"); return
+        if not (is_owner(uid) or is_co_admin(uid) or is_user_admin(uid)):
+            await q.answer("Admin only")
+            return
+        if data == "admin_gen_key":
+            if not is_owner(uid):
+                await q.answer("Owner only")
+                return
             new_key = generate_key()
-            try: supabase.table("access_keys").insert({"key": new_key, "is_used": False, "key_type": "normal"}).execute()
-            except: supabase.table("access_keys").insert({"key": new_key, "is_used": False}).execute()
-            await q.edit_message_text(f"✅ Normal Key:\n`{new_key}`", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
-        elif data=="admin_gen_uadmin_key":
-            if not is_owner(uid): await q.answer("Owner only"); return
+            db.execute("INSERT INTO access_keys (key, is_used, key_type, created_at) VALUES (?, 0, 'normal',?)",
+                       (new_key, datetime.utcnow().isoformat()))
+            db.commit()
+            await q.edit_message_text(f"✅ Normal Key:\n`{new_key}`\nOne-time use.", parse_mode="Markdown",
+                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
+        elif data == "admin_gen_uadmin_key":
+            if not is_owner(uid):
+                await q.answer("Owner only")
+                return
             new_key = generate_uadmin_key()
             set_user_state(uid, "awaiting_uadmin_nickname", {"key": new_key})
             await q.edit_message_text(f"Generated UAdmin Key:\n`{new_key}`\n\nAb iske liye Nickname bhejo jaise `Rohit Bhai`", parse_mode="Markdown")
-        elif data=="admin_list_keys":
-            if not is_owner(uid): return
-            res = supabase.table("access_keys").select("*").order("created_at", desc=True).limit(20).execute()
-            txt="🔑 Keys (20):\n\n"
-            for k in res.data:
-                status="Used" if k['is_used'] else "Unused"
-                txt+=f"{k['key']} - {status} by {k.get('used_by','-')} Nick:{k.get('nickname','-')}\n"
+        elif data == "admin_list_keys":
+            if not is_owner(uid):
+                return
+            cur = db.execute("SELECT key, is_used, used_by, nickname FROM access_keys ORDER BY created_at DESC LIMIT 20")
+            txt = "🔑 Keys (last 20):\n\n"
+            for r in cur.fetchall():
+                status = "✅ Used" if r[1] else "🟢 Unused"
+                txt += f"{r[0]} - {status} by {r[2] or '-'} Nick:{r[3] or '-'}\n"
             await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
-        elif data=="admin_add_button":
+        elif data == "admin_add_button":
             set_user_state(uid, "awaiting_new_button_name", {})
-            await q.edit_message_text("📝 Send new button NAME:")
-        elif data=="admin_manage_list":
+            await q.edit_message_text("📝 Send new button NAME (exact name that will show):")
+        elif data == "admin_manage_list":
             btns = get_manage_buttons_for_user(uid)
             if not btns:
-                await q.edit_message_text("No buttons"); return
-            rows=[]
+                await q.edit_message_text("No buttons")
+                return
+            rows = []
             for b in btns[:30]:
                 rows.append([InlineKeyboardButton(b['name'], callback_data=f"manage_btn:{b['id']}")])
             rows.append([InlineKeyboardButton("Back", callback_data="admin_panel")])
-            await q.edit_message_text("🗂 Select button:", reply_markup=InlineKeyboardMarkup(rows))
-        elif data=="admin_add_coadmin":
-            if not is_owner(uid): return
+            await q.edit_message_text("🗂 Select button to manage:", reply_markup=InlineKeyboardMarkup(rows))
+        elif data == "admin_add_coadmin":
+            if not is_owner(uid):
+                return
             set_user_state(uid, "awaiting_coadmin_id", {})
-            await q.edit_message_text("👥 Send Co-Admin User ID:")
-        elif data=="admin_list_coadmin":
-            if not is_owner(uid): return
-            res = supabase.table("co_admins").select("*").execute()
-            txt="👥 Co-Admins:\n"
-            for c in res.data: txt+=f"ID: {c['user_id']}\n"
+            await q.edit_message_text("👥 Send Co-Admin User ID (numeric):")
+        elif data == "admin_list_coadmin":
+            if not is_owner(uid):
+                return
+            cur = db.execute("SELECT user_id FROM co_admins")
+            txt = "👥 Co-Admins:\n" + "\n".join([f"ID: {r[0]}" for r in cur.fetchall()])
             await q.edit_message_text(txt or "None", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
-        elif data=="admin_list_uadmins":
-            if role not in ("owner","co_admin"): await q.answer("Owner/Co-Owner only"); return
+        elif data == "admin_list_uadmins":
+            if role not in ("owner", "co_admin"):
+                await q.answer("Owner/Co-Owner only")
+                return
             uadmins = get_all_user_admins()
             if not uadmins:
                 await q.edit_message_text("No User Admins", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
                 return
-            rows=[]
+            rows = []
             for ua in uadmins:
                 nick = ua.get('nickname') or f"UAdmin {ua['user_id']}"
                 rows.append([InlineKeyboardButton(f"{nick} (ID:{ua['user_id']})", callback_data=f"uadmin_view:{ua['user_id']}")])
             rows.append([InlineKeyboardButton("Back", callback_data="admin_panel")])
             await q.edit_message_text("👥 User Admins (Nickname):", reply_markup=InlineKeyboardMarkup(rows))
-        elif data=="admin_panel":
+        elif data == "admin_panel":
             await show_admin_panel(update, context)
         await q.answer()
 
     elif data.startswith("uadmin_view:"):
         target_id = int(data.split(":")[1])
-        ua_res = supabase.table("user_admins").select("*").eq("user_id", target_id).execute()
-        if not ua_res.data: await q.answer("Not found"); return
-        ua = ua_res.data[0]
-        nick = ua.get('nickname') or "No Nickname"
+        cur = db.execute("SELECT nickname, created_by FROM user_admins WHERE user_id =?", (target_id,))
+        r = cur.fetchone()
+        if not r:
+            await q.answer("Not found")
+            return
+        nick = r[0] or "No Nickname"
         kb = [
             [InlineKeyboardButton("📂 View Buttons", callback_data=f"uadmin_view_buttons:{target_id}")],
             [InlineKeyboardButton("✏️ Set Nickname", callback_data=f"uadmin_set_nick:{target_id}")],
             [InlineKeyboardButton("❌ Delete UAdmin", callback_data=f"uadmin_del:{target_id}")],
             [InlineKeyboardButton("Back", callback_data="admin_list_uadmins")],
         ]
-        await q.edit_message_text(f"👤 UAdmin: {nick}\nID: {target_id}\nCreated by: {ua.get('created_by')}", reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text(f"👤 UAdmin: {nick}\nID: {target_id}\nCreated by: {r[1]}", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data.startswith("uadmin_view_buttons:"):
         target_id = int(data.split(":")[1])
-        btns = supabase.table("buttons").select("*").eq("created_by", target_id).execute().data
-        if not btns:
+        cur = db.execute("SELECT id, name FROM buttons WHERE created_by =?", (target_id,))
+        rows = cur.fetchall()
+        if not rows:
             await q.edit_message_text(f"No buttons by UAdmin {target_id}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"uadmin_view:{target_id}")]]))
             return
-        rows=[]
-        for b in btns[:30]:
-            rows.append([InlineKeyboardButton(b['name'], callback_data=f"manage_btn:{b['id']}")])
-        rows.append([InlineKeyboardButton("Back", callback_data=f"uadmin_view:{target_id}")])
-        await q.edit_message_text(f"Buttons by UAdmin {target_id}:", reply_markup=InlineKeyboardMarkup(rows))
+        kb = [[InlineKeyboardButton(r[1], callback_data=f"manage_btn:{r[0]}")] for r in rows[:30]]
+        kb.append([InlineKeyboardButton("Back", callback_data=f"uadmin_view:{target_id}")])
+        await q.edit_message_text(f"Buttons by UAdmin {target_id}:", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data.startswith("uadmin_set_nick:"):
         target_id = int(data.split(":")[1])
@@ -439,8 +638,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("uadmin_del:"):
         target_id = int(data.split(":")[1])
-        if not is_owner(uid): await q.answer("Owner only"); return
-        supabase.table("user_admins").delete().eq("user_id", target_id).execute()
+        if not is_owner(uid):
+            await q.answer("Owner only")
+            return
+        db.execute("DELETE FROM user_admins WHERE user_id =?", (target_id,))
+        db.commit()
         await q.edit_message_text(f"✅ UAdmin {target_id} deleted", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_uadmins")]]))
 
     elif data.startswith("manage_btn:"):
@@ -459,14 +661,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bid = int(data.split(":")[1])
         set_user_state(uid, "awaiting_file_upload", {"button_id": bid, "upload_msg_ids": [q.message.message_id]})
         await q.edit_message_text(f"📤 Send ANY files for button {bid}.\nFiles auto-delete after Done (30 sec).\nSend multiple, then click ✅ Done below.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="m_done_upload")]]))
+                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="m_done_upload")]]))
         await q.answer()
 
-    elif data=="m_done_upload":
+    elif data == "m_done_upload":
         st = get_user_state(uid)
         upload_ids = st['data'].get('upload_msg_ids', []) if st and st['data'] else []
         chat_id = q.message.chat_id
-        for mid in upload_ids: schedule_delete_30(context.bot, chat_id, mid)
+        for mid in upload_ids:
+            schedule_delete_30(context.bot, chat_id, mid)
         schedule_delete_30(context.bot, chat_id, q.message.message_id)
         clear_user_state(uid)
         m = await q.edit_message_text("✅ Upload finished. All upload messages will disappear in 30 seconds...")
@@ -475,36 +678,37 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("m_listfiles:"):
         bid = int(data.split(":")[1])
-        res = supabase.table("button_files").select("*").eq("button_id", bid).execute()
-        if not res.data:
+        cur = db.execute("SELECT id, file_type FROM button_files WHERE button_id =?", (bid,))
+        rows = cur.fetchall()
+        if not rows:
             await q.edit_message_text("No files", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
             return
-        rows=[]
-        for f in res.data[:20]:
-            rows.append([InlineKeyboardButton(f"🗑 {f['file_type']} {f['id']}", callback_data=f"m_delfile:{f['id']}:{bid}")])
-        rows.append([InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")])
-        await q.edit_message_text(f"Files for {bid}:", reply_markup=InlineKeyboardMarkup(rows))
+        kb = [[InlineKeyboardButton(f"🗑 {r[1]} {r[0]}", callback_data=f"m_delfile:{r[0]}:{bid}")] for r in rows[:20]]
+        kb.append([InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")])
+        await q.edit_message_text(f"Files for {bid}:", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data.startswith("m_delfile:"):
         _, fid, bid = data.split(":")
-        supabase.table("button_files").delete().eq("id", int(fid)).execute()
+        db.execute("DELETE FROM button_files WHERE id =?", (int(fid),))
+        db.commit()
         await q.answer("Deleted")
         await q.edit_message_text("Deleted", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
 
     elif data.startswith("m_delbtn:"):
         bid = int(data.split(":")[1])
-        # owner, co-admin, ya button ka creator hi delete kar sakta hai
-        btn_res = supabase.table("buttons").select("created_by").eq("id", bid).execute()
-        if btn_res.data:
-            c_by = btn_res.data[0].get('created_by')
-            if role == "user_admin" and c_by and int(c_by)!= int(uid):
-                await q.answer("❌ Sirf apna button delete kar sakte ho"); return
-        supabase.table("buttons").delete().eq("id", bid).execute()
-        await q.edit_message_text("✅ Button Deleted"); await q.answer()
+        cur = db.execute("SELECT created_by FROM buttons WHERE id =?", (bid,))
+        r = cur.fetchone()
+        if r and role == "user_admin" and r[0] and int(r[0])!= int(uid):
+            await q.answer("❌ Sirf apna button delete kar sakte ho")
+            return
+        db.execute("DELETE FROM buttons WHERE id =?", (bid,))
+        db.commit()
+        await q.edit_message_text("✅ Button Deleted")
+        await q.answer()
 
     elif data.startswith("m_vis:"):
         bid = int(data.split(":")[1])
-        rows=[]
+        rows = []
         for name, val in VIS_OPTIONS:
             rows.append([InlineKeyboardButton(name, callback_data=f"m_vis_set:{bid}:{val}")])
         rows.append([InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")])
@@ -512,26 +716,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("m_vis_set:"):
         parts = data.split(":")
-        bid = int(parts[1]); vis = parts[2]
+        bid = int(parts[1])
+        vis = parts[2]
         if vis == "specific_uadmin":
             uadmins = get_all_user_admins()
             if not uadmins:
-                await q.edit_message_text("No UAdmins"); return
-            rows=[]
+                await q.edit_message_text("No UAdmins")
+                return
+            rows = []
             for ua in uadmins:
                 nick = ua.get('nickname') or f"UAdmin {ua['user_id']}"
                 rows.append([InlineKeyboardButton(f"{nick} (ID:{ua['user_id']})", callback_data=f"m_vis_specific:{bid}:{ua['user_id']}")])
             rows.append([InlineKeyboardButton("Back", callback_data=f"m_vis:{bid}")])
             await q.edit_message_text("👤 Select UAdmin:", reply_markup=InlineKeyboardMarkup(rows))
-            await q.answer(); return
-        supabase.table("buttons").update({"visibility": vis, "visible_to_user_id": None}).eq("id", bid).execute()
+            await q.answer()
+            return
+        db.execute("UPDATE buttons SET visibility =?, visible_to_user_id = NULL WHERE id =?", (vis, bid))
+        db.commit()
         await q.answer(f"Vis -> {vis}")
         await q.edit_message_text(f"Visibility changed to {vis}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
 
     elif data.startswith("m_vis_specific:"):
         _, bid, target_id = data.split(":")
-        bid=int(bid); target_id=int(target_id)
-        supabase.table("buttons").update({"visibility": "specific_uadmin", "visible_to_user_id": target_id}).eq("id", bid).execute()
+        db.execute("UPDATE buttons SET visibility = 'specific_uadmin', visible_to_user_id =? WHERE id =?", (int(target_id), int(bid)))
+        db.commit()
         await q.edit_message_text(f"Visibility -> Specific UAdmin {target_id}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -543,40 +751,39 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state == "awaiting_access_key":
         key_input = text.upper().strip()
-        res = supabase.table("access_keys").select("*").eq("key", key_input).eq("is_used", False).execute()
-        if res.data:
-            row = res.data[0]
-            is_uadmin_key = key_input.startswith("UADMIN-") or row.get('key_type') == 'uadmin'
-            supabase.table("access_keys").update({"is_used": True, "used_by": int(uid)}).eq("key", key_input).execute()
-            supabase.table("authorized_users").upsert({"user_id": int(uid)}, on_conflict="user_id").execute()
+        cur = db.execute("SELECT key, nickname, key_type FROM access_keys WHERE key =? AND is_used = 0", (key_input,))
+        r = cur.fetchone()
+        if r:
+            is_uadmin_key = key_input.startswith("UADMIN-") or r[2] == 'uadmin'
+            db.execute("UPDATE access_keys SET is_used = 1, used_by =? WHERE key =?", (int(uid), key_input))
+            db.execute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)", (int(uid), datetime.utcnow().isoformat()))
             if is_uadmin_key:
-                nick = row.get('nickname') or f"UAdmin-{uid}"
-                try:
-                    supabase.table("user_admins").upsert({"user_id": int(uid), "nickname": nick, "created_by": int(OWNER_ID)}, on_conflict="user_id").execute()
-                except Exception as e:
-                    print(e)
+                nick = r[1] or f"UAdmin-{uid}"
+                db.execute("INSERT OR REPLACE INTO user_admins (user_id, nickname, created_by, created_at) VALUES (?,?,?,?)",
+                           (int(uid), nick, int(OWNER_ID), datetime.utcnow().isoformat()))
+                db.commit()
                 clear_user_state(uid)
                 await update.effective_message.reply_text(f"✅ User Admin Access Granted!\nNickname: {nick}\nAb tum apna alag partition use karoge.")
             else:
+                db.commit()
                 clear_user_state(uid)
                 await update.effective_message.reply_text("✅ Access granted!")
             await show_main_menu(update, context, 0)
         else:
-            await update.effective_message.reply_text("❌ Invalid or used key.")
+            await update.effective_message.reply_text("❌ Invalid or used key. Try again or contact owner.")
         return
 
     if not is_authorized(uid):
         set_user_state(uid, "awaiting_access_key", {})
-        await update.effective_message.reply_text("🔐 Send Access Key first.")
+        await update.effective_message.reply_text("🔐 Send Access Key first. Format KEY-XXXXXXXX / UADMIN-XXXXXXXX")
         return
 
     if state == "awaiting_uadmin_nickname":
         nick = text
         key = sdata.get('key')
-        try:
-            supabase.table("access_keys").insert({"key": key, "is_used": False, "nickname": nick, "key_type": "uadmin"}).execute()
-        except:
-            supabase.table("access_keys").insert({"key": key, "is_used": False}).execute()
+        db.execute("INSERT INTO access_keys (key, is_used, nickname, key_type, created_at) VALUES (?, 0,?, 'uadmin',?)",
+                   (key, nick, datetime.utcnow().isoformat()))
+        db.commit()
         clear_user_state(uid)
         await update.effective_message.reply_text(f"✅ UAdmin Key Created:\n`{key}`\nNickname: {nick}\nIsko bhejo, user auto UAdmin ban jayega.", parse_mode="Markdown")
         return
@@ -584,78 +791,147 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == "awaiting_set_nickname":
         target_id = sdata.get('target_id')
         new_nick = text
-        supabase.table("user_admins").update({"nickname": new_nick}).eq("user_id", target_id).execute()
+        db.execute("UPDATE user_admins SET nickname =? WHERE user_id =?", (new_nick, target_id))
+        db.commit()
         clear_user_state(uid)
         await update.effective_message.reply_text(f"✅ Nickname updated for ID {target_id} -> {new_nick}")
         return
 
     if state == "awaiting_new_button_name":
-        if not text: await update.effective_message.reply_text("Send valid name"); return
+        if not text:
+            await update.effective_message.reply_text("Send valid name")
+            return
         set_user_state(uid, "awaiting_new_button_vis", {"name": text})
-        rows=[]
-        for name, val in VIS_OPTIONS:
-            rows.append([InlineKeyboardButton(name, callback_data=f"vis_{val}")])
+        rows = [[InlineKeyboardButton(name, callback_data=f"vis_{val}")] for name, val in VIS_OPTIONS]
         await update.effective_message.reply_text("👁 Choose visibility:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if state == "awaiting_new_button_vis":
+        # Fallback if user types text instead of clicking
+        vis = "all"
+        if "Owner Only" in text:
+            vis = "owner_only"
+        try:
+            db.execute("INSERT INTO buttons (name, visibility, btn_type, created_by) VALUES (?,?, 'callback',?)",
+                       (sdata['name'], vis, int(uid)))
+            db.commit()
+            await update.effective_message.reply_text(f"✅ Button '{sdata['name']}' created! (Normal)")
+        except Exception as e:
+            if "UNIQUE" in str(e):
+                await update.effective_message.reply_text("❌ Button name already exists!")
+            else:
+                await update.effective_message.reply_text(f"Error: {e}")
+        clear_user_state(uid)
+        await show_main_menu(update, context, 0)
         return
 
     if state == "awaiting_coadmin_id":
         try:
             new_id = int(re.search(r'\d+', text).group())
-            supabase.table("co_admins").upsert({"user_id": new_id, "added_by": int(uid)}, on_conflict="user_id").execute()
-            supabase.table("authorized_users").upsert({"user_id": new_id}, on_conflict="user_id").execute()
+            db.execute("INSERT OR REPLACE INTO co_admins (user_id, added_by, created_at) VALUES (?,?,?)",
+                       (new_id, int(uid), datetime.utcnow().isoformat()))
+            db.execute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)",
+                       (new_id, datetime.utcnow().isoformat()))
+            db.commit()
             await update.effective_message.reply_text(f"✅ Co-Admin added: {new_id}")
         except Exception as e:
-            await update.effective_message.reply_text(f"Error: {e}")
-        clear_user_state(uid); return
+            await update.effective_message.reply_text(f"Error: {e} - send numeric ID")
+        clear_user_state(uid)
+        return
 
     if state == "awaiting_file_upload":
         bid = sdata.get('button_id')
         upload_ids = sdata.get('upload_msg_ids', [])
         if text == "✅ Done":
             chat_id = update.effective_chat.id
-            for mid in upload_ids: schedule_delete_30(context.bot, chat_id, mid)
+            for mid in upload_ids:
+                schedule_delete_30(context.bot, chat_id, mid)
             clear_user_state(uid)
-            m = await update.effective_message.reply_text("✅ Upload finished. 30 sec me delete...")
+            m = await update.effective_message.reply_text("✅ Upload finished. All upload messages will disappear in 30 seconds...")
             schedule_delete_30(context.bot, chat_id, m.message_id)
             schedule_delete_30(context.bot, chat_id, update.effective_message.message_id)
             return
+
         msg = update.effective_message
         upload_ids.append(msg.message_id)
-        file_info=None
+
+        file_info = None
         if msg.photo:
-            p=msg.photo[-1]
-            file_info={"file_id": p.file_id, "file_unique_id": p.file_unique_id, "file_type": "photo", "caption": msg.caption or ""}
+            p = msg.photo[-1]
+            file_info = {"file_id": p.file_id, "file_unique_id": p.file_unique_id, "file_type": "photo", "caption": msg.caption or ""}
         elif msg.document:
-            file_info={"file_id": msg.document.file_id, "file_unique_id": msg.document.file_unique_id, "file_type": "document", "caption": msg.caption or msg.document.file_name or ""}
+            file_info = {"file_id": msg.document.file_id, "file_unique_id": msg.document.file_unique_id, "file_type": "document", "caption": msg.caption or msg.document.file_name or ""}
         elif msg.video:
-            file_info={"file_id": msg.video.file_id, "file_unique_id": msg.video.file_unique_id, "file_type": "video", "caption": msg.caption or ""}
+            file_info = {"file_id": msg.video.file_id, "file_unique_id": msg.video.file_unique_id, "file_type": "video", "caption": msg.caption or ""}
         elif msg.audio:
-            file_info={"file_id": msg.audio.file_id, "file_unique_id": msg.audio.file_unique_id, "file_type": "audio", "caption": msg.caption or ""}
+            file_info = {"file_id": msg.audio.file_id, "file_unique_id": msg.audio.file_unique_id, "file_type": "audio", "caption": msg.caption or ""}
         elif msg.voice:
-            file_info={"file_id": msg.voice.file_id, "file_unique_id": msg.voice.file_unique_id, "file_type": "voice", "caption": msg.caption or ""}
+            file_info = {"file_id": msg.voice.file_id, "file_unique_id": msg.voice.file_unique_id, "file_type": "voice", "caption": msg.caption or ""}
         elif msg.video_note:
-            file_info={"file_id": msg.video_note.file_id, "file_unique_id": msg.video_note.file_unique_id, "file_type": "video_note", "caption": ""}
+            file_info = {"file_id": msg.video_note.file_id, "file_unique_id": msg.video_note.file_unique_id, "file_type": "video_note", "caption": ""}
         elif msg.sticker:
-            file_info={"file_id": msg.sticker.file_id, "file_unique_id": msg.sticker.file_unique_id, "file_type": "sticker", "caption": ""}
-        elif text and text!="✅ Done":
-            file_info={"file_id": f"text_{uuid.uuid4()}", "file_unique_id": f"textu_{uuid.uuid4()}", "file_type": "text", "caption": text}
+            file_info = {"file_id": msg.sticker.file_id, "file_unique_id": msg.sticker.file_unique_id, "file_type": "sticker", "caption": ""}
+        elif text and text!= "✅ Done":
+            file_info = {"file_id": f"text_{uuid.uuid4()}", "file_unique_id": f"textu_{uuid.uuid4()}", "file_type": "text", "caption": text}
+
         if file_info:
             try:
-                supabase.table("button_files").insert({
-                    "button_id": bid, "file_id": file_info['file_id'],
-                    "file_unique_id": file_info['file_unique_id'],
-                    "file_type": file_info['file_type'], "caption": file_info['caption']
-                }).execute()
+                # BACKUP TO PRIVATE CHANNEL - NO FORWARD TAG RENEW SYSTEM
+                backup_chat = None
+                backup_mid = None
+                if BACKUP_CHANNEL_ID and file_info['file_type']!= 'text':
+                    try:
+                        if file_info['file_type'] == 'photo':
+                            bm = await context.bot.send_photo(int(BACKUP_CHANNEL_ID), photo=file_info['file_id'], caption=file_info['caption'] or f"backup btn {bid}")
+                        elif file_info['file_type'] == 'video':
+                            bm = await context.bot.send_video(int(BACKUP_CHANNEL_ID), video=file_info['file_id'], caption=file_info['caption'] or "")
+                        elif file_info['file_type'] == 'document':
+                            bm = await context.bot.send_document(int(BACKUP_CHANNEL_ID), document=file_info['file_id'], caption=file_info['caption'] or "")
+                        elif file_info['file_type'] == 'audio':
+                            bm = await context.bot.send_audio(int(BACKUP_CHANNEL_ID), audio=file_info['file_id'], caption=file_info['caption'] or "")
+                        elif file_info['file_type'] == 'voice':
+                            bm = await context.bot.send_voice(int(BACKUP_CHANNEL_ID), voice=file_info['file_id'], caption=file_info['caption'] or "")
+                        else:
+                            bm = await context.bot.copy_message(chat_id=int(BACKUP_CHANNEL_ID), from_chat_id=update.effective_chat.id, message_id=msg.message_id)
+                        backup_chat = int(BACKUP_CHANNEL_ID)
+                        backup_mid = bm.message_id
+                    except Exception as be:
+                        print(f"Backup failed: {be}")
+
+                db.execute("INSERT INTO button_files (button_id, file_id, file_unique_id, file_type, caption, backup_chat_id, backup_message_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                           (bid, file_info['file_id'], file_info['file_unique_id'], file_info['file_type'], file_info['caption'], backup_chat, backup_mid, datetime.utcnow().isoformat()))
+                db.commit()
+
                 kb_done = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="m_done_upload")]])
-                confirm = await update.effective_message.reply_text(f"✅ Added {file_info['file_type']}. Niche Done dabao ya aur bhejo.", reply_markup=kb_done)
+                confirm = await update.effective_message.reply_text(f"✅ Added {file_info['file_type']}. Backup: {'Yes' if backup_mid else 'No'}. Niche Done dabao ya aur file bhejo.", reply_markup=kb_done)
                 upload_ids.append(confirm.message_id)
-                sdata['upload_msg_ids']=upload_ids
+                sdata['upload_msg_ids'] = upload_ids
                 set_user_state(uid, "awaiting_file_upload", sdata)
             except Exception as e:
                 await update.effective_message.reply_text(f"Error saving: {e}")
         return
 
-# ---------- Setup ----------
+    # Direct button name search - exact same as old bot
+    if text:
+        try:
+            cur = db.execute("SELECT id, name, visibility, created_by, visible_to_user_id FROM buttons")
+            all_btns = [{"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4]} for r in cur.fetchall()]
+            matched = None
+            for b in all_btns:
+                if b['name'].lower().strip() == text.lower().strip() or clean_button_text(b['name']).lower() == clean_button_text(text).lower():
+                    matched = b
+                    break
+            if matched:
+                role = get_user_role(uid)
+                if not can_view_button(uid, matched, role, get_user_admin_ids()):
+                    await update.effective_message.reply_text("❌ Owner only button")
+                    return
+                await send_button_files(update, context, matched)
+                return
+        except Exception as e:
+            print(e)
+
+# ---------- Telegram App Setup ----------
 tg_app = Application.builder().token(BOT_TOKEN).build()
 tg_app.add_handler(CommandHandler("start", start_handler))
 tg_app.add_handler(CallbackQueryHandler(callback_handler))
@@ -666,26 +942,36 @@ asyncio.set_event_loop(loop)
 loop.run_until_complete(tg_app.initialize())
 loop.run_until_complete(tg_app.start())
 
+# ---------- Flask Routes ----------
 @app.route("/")
-def home(): return "Bot Running - UADMIN + Nickname + Visibility OK"
+def home():
+    return "Bot Running - TURSO + BACKUP CHANNEL + NO FORWARD TAG - Polling 24/7 - UptimeRobot OK"
 
 @app.route("/keep-alive")
 def keep_alive():
     try:
-        supabase.table("buttons").select("id").limit(1).execute()
-        return jsonify({"status":"ok"}),200
+        db.execute("SELECT 1")
+        return jsonify({"status": "ok", "msg": "Turso pinged - backup channel alive"}), 200
     except Exception as e:
-        return jsonify({"error":str(e)}),500
+        return jsonify({"status": "error", "error": str(e)}), 500
 
+# ---------- POLLING 24/7 RUNNER ----------
 if __name__ == "__main__":
     def run_flask():
-        port=int(os.getenv("PORT",5000))
+        port = int(os.getenv("PORT", 5000))
+        print(f"Flask for UptimeRobot running on 0.0.0.0:{port}")
         app.run(host="0.0.0.0", port=port, use_reloader=False)
+
     threading.Thread(target=run_flask, daemon=True).start()
+
     async def start_polling():
-        try: await tg_app.bot.delete_webhook(drop_pending_updates=True)
-        except: pass
+        try:
+            await tg_app.bot.delete_webhook(drop_pending_updates=True)
+            print("Webhook deleted, polling mode...")
+        except Exception as e:
+            print(f"Delete webhook error: {e}")
         await tg_app.updater.start_polling(drop_pending_updates=True)
-        print(f"✅ Polling started Owner {OWNER_ID}")
+        print(f"✅ Polling started! Owner {OWNER_ID} Turso ready. Backup: {BACKUP_CHANNEL_ID}")
+
     loop.run_until_complete(start_polling())
     loop.run_forever()
