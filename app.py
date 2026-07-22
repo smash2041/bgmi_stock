@@ -30,12 +30,78 @@ if not BACKUP_CHANNEL_ID:
     print("WARNING: BACKUP_CHANNEL_ID not set - backup disabled, renew fail hoga!")
 
 # ---------------- TURSO SETUP ----------------
-import libsql_experimental as libsql
+import requests
 
-# Turso connect
-db = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
-db.execute("PRAGMA foreign_keys = ON;")
-db.execute("PRAGMA journal_mode = WAL;")
+class TursoCursor:
+    def __init__(self, rows):
+        self._rows = rows
+    def fetchall(self):
+        return self._rows
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+class TursoDB:
+    def __init__(self, url, token):
+        self.http_url = url.replace("libsql://", "https://").rstrip("/") + "/v2/pipeline"
+        self.token = token
+        self.last_id = None
+
+    def _args(self, params):
+        args = []
+        for p in params:
+            if p is None:
+                args.append({"type": "null"})
+            elif isinstance(p, int):
+                args.append({"type": "integer", "value": str(p)})
+            elif isinstance(p, float):
+                args.append({"type": "float", "value": p})
+            else:
+                args.append({"type": "text", "value": str(p)})
+        return args
+
+    def execute(self, sql, params=()):
+        payload = {
+            "requests": [
+                {"type": "execute", "stmt": {"sql": sql, "args": self._args(params)}},
+                {"type": "close"}
+            ]
+        }
+        headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+        r = requests.post(self.http_url, json=payload, headers=headers, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        rows = []
+        if "results" in data and len(data["results"])>0:
+            res = data["results"][0]
+            if res.get("type") == "ok":
+                result = res.get("response", {}).get("result", {})
+                # last insert id
+                if "last_insert_rowid" in result:
+                    try:
+                        self.last_id = int(result["last_insert_rowid"])
+                    except:
+                        pass
+                raw_rows = result.get("rows", [])
+                for row in raw_rows:
+                    parsed = []
+                    for col in row:
+                        t = col.get("type")
+                        v = col.get("value")
+                        if t == "integer":
+                            parsed.append(int(v))
+                        elif t == "float":
+                            parsed.append(float(v))
+                        elif t == "null":
+                            parsed.append(None)
+                        else:
+                            parsed.append(v)
+                    rows.append(tuple(parsed))
+        return TursoCursor(rows)
+
+    def commit(self):
+        pass # HTTP me auto-commit hota hai
+
+db = TursoDB(TURSO_URL, TURSO_TOKEN)
 
 def init_db():
     """Saare tables banata hai agar exist nahi karte"""
