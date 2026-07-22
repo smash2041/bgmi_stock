@@ -1,4 +1,4 @@
-# app.py - SINGLE FILE MERGED - POLLING 24/7 - ONLY INLINE BUTTONS - NO COLOUR TYPE
+# app.py - SINGLE FILE MERGED - POLLING 24/7 - ONLY INLINE BUTTONS - NO COLOUR TYPE + 30 SEC UPLOAD AUTO DELETE
 # Requirements: pip install Flask python-telegram-bot>=21.4 supabase python-dotenv
 # ENV: BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY (service_role), OWNER_ID
 # Start: python app.py
@@ -83,10 +83,11 @@ async def auto_delete_message(bot, chat_id, message_id, delay=15):
 def schedule_delete(bot, chat_id, message_id):
     asyncio.create_task(auto_delete_message(bot, chat_id, message_id, 15))
 
-# ---------- CHANGED: Only callback normal, no colour copy/url ----------
+def schedule_delete_30(bot, chat_id, message_id):
+    asyncio.create_task(auto_delete_message(bot, chat_id, message_id, 30))
+
 def build_inline_button(btn):
     name = btn['name']
-    # Force only normal callback, colour system removed
     return InlineKeyboardButton(text=name, callback_data=f"view_btn:{btn['id']}:0")
 
 PER_PAGE = 15
@@ -152,13 +153,11 @@ async def send_button_files(update, context, button):
     except Exception as e:
         await context.bot.send_message(chat_id, f"Error: {e}")
 
-# ---------- CHANGED: No ReplyKeyboard, only Inline on top ----------
 async def show_main_menu(update, context, page=0):
     uid = update.effective_user.id
     show_owner = is_owner(uid)
     buttons, total = get_buttons_paginated(page, show_owner_only=show_owner)
     total_pages = max(1, (total + PER_PAGE - 1)//PER_PAGE)
-
     inline_rows = []
     r = []
     for b in buttons:
@@ -166,15 +165,12 @@ async def show_main_menu(update, context, page=0):
         if len(r)==2:
             inline_rows.append(r); r=[]
     if r: inline_rows.append(r)
-
     pag_row = []
     if page>0: pag_row.append(InlineKeyboardButton("⬅ Prev", callback_data=f"main_page:{page-1}"))
     if page < total_pages-1: pag_row.append(InlineKeyboardButton("Next ➡", callback_data=f"main_page:{page+1}"))
     if pag_row: inline_rows.append(pag_row)
-
     if is_owner(uid) or is_co_admin(uid):
         inline_rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel")])
-
     context.user_data['main_page'] = page
     text = f"📂 Main Menu (Page {page+1}/{total_pages}) - {total} buttons\nSelect any button:"
     try:
@@ -216,7 +212,6 @@ async def show_admin_panel(update, context):
     except:
         await update.effective_message.reply_text("🛠 Admin Panel", reply_markup=InlineKeyboardMarkup(kb))
 
-# ---------- Handlers ----------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if is_authorized(uid):
@@ -249,7 +244,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = int(data.split(":")[1])
         await show_main_menu(update, context, page)
 
-    # CHANGED: Visibility via Inline
     elif data.startswith("vis_"):
         st = get_user_state(uid)
         if not st or st['state']!="awaiting_new_button_vis":
@@ -257,13 +251,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sdata = st['data']
         vis = "all" if data=="vis_public" else "owner_only"
         try:
-            ins = {
-                "name": sdata['name'],
-                "visibility": vis,
-                "btn_type": "callback",
-                "color": "",
-                "emoji": ""
-            }
+            ins = {"name": sdata['name'], "visibility": vis, "btn_type": "callback", "color": "", "emoji": ""}
             supabase.table("buttons").insert(ins).execute()
             await q.edit_message_text(f"✅ Button '{sdata['name']}' created! (Normal callback)")
         except Exception as e:
@@ -322,7 +310,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("manage_btn:"):
         bid = int(data.split(":")[1])
-        # CHANGED: Colour button removed
         rows = [
             [InlineKeyboardButton("📤 Add Files", callback_data=f"m_addfile:{bid}")],
             [InlineKeyboardButton("📄 List/Delete Files", callback_data=f"m_listfiles:{bid}")],
@@ -335,14 +322,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("m_addfile:"):
         bid = int(data.split(":")[1])
-        set_user_state(uid, "awaiting_file_upload", {"button_id": bid})
-        await q.edit_message_text(f"📤 Send ANY files for button {bid}.\nSend multiple, then type ✅ Done",
+        # EDITED: track upload msg ids for 30 sec auto delete
+        set_user_state(uid, "awaiting_file_upload", {"button_id": bid, "upload_msg_ids": [q.message.message_id]})
+        await q.edit_message_text(f"📤 Send ANY files for button {bid}.\nFiles auto-delete after Done (30 sec).\nSend multiple, then click ✅ Done below.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="m_done_upload")]]))
         await q.answer()
 
     elif data=="m_done_upload":
+        # EDITED: 30 sec auto delete all upload chat
+        st = get_user_state(uid)
+        upload_ids = []
+        if st and st['data']:
+            upload_ids = st['data'].get('upload_msg_ids', [])
+        # schedule delete for all tracked ids + current message
+        chat_id = q.message.chat_id
+        for mid in upload_ids:
+            schedule_delete_30(context.bot, chat_id, mid)
+        schedule_delete_30(context.bot, chat_id, q.message.message_id)
+
         clear_user_state(uid)
-        await q.edit_message_text("✅ Upload finished.")
+        m = await q.edit_message_text("✅ Upload finished. All upload messages will disappear in 30 seconds...")
+        schedule_delete_30(context.bot, chat_id, m.message_id)
         await q.answer()
 
     elif data.startswith("m_listfiles:"):
@@ -414,7 +414,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text("Send valid name")
             return
         set_user_state(uid, "awaiting_new_button_vis", {"name": text})
-        # CHANGED: Visibility via Inline, no ReplyKeyboard
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("Public (All Users)", callback_data="vis_public")],
             [InlineKeyboardButton("Owner Only", callback_data="vis_owner_only")]
@@ -422,17 +421,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("👁 Choose visibility:", reply_markup=kb)
         return
 
-    # CHANGED: Direct create normal callback button, no type/color ask
     if state == "awaiting_new_button_vis":
         vis = "all" if "Public" in text else "owner_only" if "Owner" in text else "all"
         try:
-            ins = {
-                "name": sdata['name'],
-                "visibility": vis,
-                "btn_type": "callback",
-                "color": "",
-                "emoji": ""
-            }
+            ins = {"name": sdata['name'], "visibility": vis, "btn_type": "callback", "color": "", "emoji": ""}
             supabase.table("buttons").insert(ins).execute()
             await update.effective_message.reply_text(f"✅ Button '{sdata['name']}' created! (Normal)")
         except Exception as e:
@@ -457,11 +449,22 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state == "awaiting_file_upload":
         bid = sdata.get('button_id')
+        upload_ids = sdata.get('upload_msg_ids', [])
         if text == "✅ Done":
+            # Same as Done button
+            chat_id = update.effective_chat.id
+            for mid in upload_ids:
+                schedule_delete_30(context.bot, chat_id, mid)
             clear_user_state(uid)
-            await update.effective_message.reply_text("✅ Upload finished")
+            m = await update.effective_message.reply_text("✅ Upload finished. All upload messages will disappear in 30 seconds...")
+            schedule_delete_30(context.bot, chat_id, m.message_id)
+            schedule_delete_30(context.bot, chat_id, update.effective_message.message_id)
             return
+
         msg = update.effective_message
+        # Track user file msg for auto delete after Done
+        upload_ids.append(msg.message_id)
+
         file_info = None
         if msg.photo:
             p = msg.photo[-1]
@@ -480,6 +483,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_info = {"file_id": msg.sticker.file_id, "file_unique_id": msg.sticker.file_unique_id, "file_type": "sticker", "caption": ""}
         elif text and text!="✅ Done":
             file_info = {"file_id": f"text_{uuid.uuid4()}", "file_unique_id": f"textu_{uuid.uuid4()}", "file_type": "text", "caption": text}
+
         if file_info:
             try:
                 supabase.table("button_files").insert({
@@ -489,12 +493,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "file_type": file_info['file_type'],
                     "caption": file_info['caption']
                 }).execute()
-                await update.effective_message.reply_text(f"✅ Added {file_info['file_type']}. Send more or type ✅ Done")
+                # EDITED: Done button just below file
+                kb_done = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="m_done_upload")]])
+                confirm = await update.effective_message.reply_text(f"✅ Added {file_info['file_type']}. Niche Done dabao ya aur file bhejo.", reply_markup=kb_done)
+                upload_ids.append(confirm.message_id)
+                # Update state with new ids
+                sdata['upload_msg_ids'] = upload_ids
+                set_user_state(uid, "awaiting_file_upload", sdata)
             except Exception as e:
                 await update.effective_message.reply_text(f"Error saving: {e}")
         return
 
-    # Old ReplyKeyboard text handlers removed, only inline remains
     if text:
         try:
             show_all = is_owner(uid)
@@ -558,7 +567,7 @@ def set_webhook():
     loop.run_until_complete(_set())
     return f"Webhook set to {full}"
 
-# ---------- POLLING 24/7 RUNNER - NO GUNICORN ----------
+# ---------- POLLING 24/7 RUNNER ----------
 if __name__ == "__main__":
     def run_flask():
         port = int(os.getenv("PORT", 5000))
