@@ -90,6 +90,10 @@ class TursoDB:
         self.http_url = url.replace("libsql://", "https://").rstrip("/") + "/v2/pipeline"
         self.token = token
         self.session = requests.Session()
+        self.headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json"
+        }
 
     def _args(self, params):
         """Convert python params to Turso HTTP args format"""
@@ -116,11 +120,7 @@ class TursoDB:
                 {"type": "close"}
             ]
         }
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json"
-        }
-        r = self.session.post(self.http_url, json=payload, headers=headers, timeout=30)
+        r = self.session.post(self.http_url, json=payload, headers=self.headers, timeout=30)
         r.raise_for_status()
         data = r.json()
         rows = []
@@ -235,6 +235,10 @@ def init_db():
         FOREIGN KEY(button_id) REFERENCES buttons(id) ON DELETE CASCADE
     )""")
 
+    db.execute("CREATE INDEX IF NOT EXISTS idx_button_files_button_id ON button_files(button_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_buttons_created_by ON buttons(created_by)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_buttons_visible_to_user_id ON buttons(visible_to_user_id)")
+
     print("✅ Turso tables ready + banned_users + backup support")
 
 # Init tables on import
@@ -266,12 +270,23 @@ async def safe_edit(q, text, markup=None):
 
 CACHE = {
     "co_ids": [],
+    "co_ids_set": set(),
     "uadmins": [],
+    "uadmin_ids": [],
+    "uadmin_ids_set": set(),
+    "ts": 0
+}
+
+ACCESS_CACHE = {
+    "authorized_ids": set(),
+    "banned_ids": set(),
     "ts": 0
 }
 
 BUTTON_CACHE = {
     "buttons": [],
+    "by_id": {},
+    "name_map": {},
     "ts": 0
 }
 
@@ -286,15 +301,39 @@ def refresh_cache(force=False):
     try:
         cur = db.execute("SELECT user_id FROM co_admins")
         CACHE["co_ids"] = [int(r[0]) for r in cur.fetchall()]
+        CACHE["co_ids_set"] = set(CACHE["co_ids"])
 
         cur = db.execute("SELECT user_id, nickname, created_by, created_at FROM user_admins ORDER BY created_at DESC")
         CACHE["uadmins"] = [
             {"user_id": r[0], "nickname": r[1], "created_by": r[2], "created_at": r[3]}
             for r in cur.fetchall()
         ]
+        CACHE["uadmin_ids"] = [int(x['user_id']) for x in CACHE["uadmins"]]
+        CACHE["uadmin_ids_set"] = set(CACHE["uadmin_ids"])
         CACHE["ts"] = now
     except Exception as e:
         print(f"cache refresh error {e}")
+
+def refresh_access_cache(force=False):
+    """Refresh auth/ban cache to avoid Turso hits on every message/click"""
+    now = time.time()
+    if not force and now - ACCESS_CACHE["ts"] < 15:
+        return
+    try:
+        cur = db.execute("SELECT user_id FROM authorized_users")
+        ACCESS_CACHE["authorized_ids"] = {int(r[0]) for r in cur.fetchall()}
+
+        cur = db.execute("SELECT user_id FROM banned_users")
+        ACCESS_CACHE["banned_ids"] = {int(r[0]) for r in cur.fetchall()}
+        ACCESS_CACHE["ts"] = now
+    except Exception as e:
+        print(f"access cache refresh error {e}")
+
+def invalidate_access_cache():
+    """Clear auth/ban cache after access changes"""
+    ACCESS_CACHE["authorized_ids"] = set()
+    ACCESS_CACHE["banned_ids"] = set()
+    ACCESS_CACHE["ts"] = 0
 
 def get_all_user_admins():
     """Get all user admins from cache"""
@@ -309,13 +348,24 @@ def get_all_co_admin_ids():
 def get_user_admin_ids():
     """Get only ids of user admins"""
     try:
-        return [int(x['user_id']) for x in get_all_user_admins()]
+        refresh_cache()
+        return CACHE["uadmin_ids"]
     except:
         return []
+
+def get_user_admin_id_set():
+    """Get user-admin ids as a set for fast membership checks"""
+    try:
+        refresh_cache()
+        return CACHE["uadmin_ids_set"]
+    except:
+        return set()
 
 def invalidate_button_cache():
     """Clear button cache after any button/file/visibility change"""
     BUTTON_CACHE["buttons"] = []
+    BUTTON_CACHE["by_id"] = {}
+    BUTTON_CACHE["name_map"] = {}
     BUTTON_CACHE["ts"] = 0
 
 LOCK_EMOJI = "\U0001F512"
@@ -342,6 +392,9 @@ def is_owner_created_button(btn):
 def get_button_by_id(bid):
     """Fetch one button with lock metadata"""
     try:
+        cached = BUTTON_CACHE.get("by_id", {}).get(int(bid))
+        if cached and time.time() - BUTTON_CACHE["ts"] < 8:
+            return cached
         cur = db.execute(
             "SELECT id, name, visibility, created_by, visible_to_user_id, locked FROM buttons WHERE id =?",
             (int(bid),)
@@ -365,6 +418,15 @@ def get_all_buttons_cached(force=False):
             {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4], "locked": r[5]}
             for r in cur.fetchall()
         ]
+        BUTTON_CACHE["by_id"] = {int(b["id"]): b for b in BUTTON_CACHE["buttons"]}
+        BUTTON_CACHE["name_map"] = {}
+        for b in BUTTON_CACHE["buttons"]:
+            name_lower = (b["name"] or "").lower().strip()
+            clean_lower = clean_button_text(b["name"]).lower()
+            b["_name_lower"] = name_lower
+            b["_clean_name_lower"] = clean_lower
+            BUTTON_CACHE["name_map"].setdefault(name_lower, b)
+            BUTTON_CACHE["name_map"].setdefault(clean_lower, b)
         BUTTON_CACHE["ts"] = now
     except Exception as e:
         print(f"button cache error {e}")
@@ -389,8 +451,8 @@ def is_owner(uid):
 def is_banned(uid):
     """Check if user is banned"""
     try:
-        cur = db.execute("SELECT user_id FROM banned_users WHERE user_id =?", (int(uid),))
-        return len(cur.fetchall()) > 0
+        refresh_access_cache()
+        return int(uid) in ACCESS_CACHE["banned_ids"]
     except:
         return False
 
@@ -398,43 +460,51 @@ def is_co_admin(uid):
     """Check if user is co-admin"""
     if is_banned(uid):
         return False
-    return int(uid) in get_all_co_admin_ids()
+    refresh_cache()
+    return int(uid) in CACHE["co_ids_set"]
 
 def is_user_admin(uid):
     """Check if user is user-admin"""
     if is_banned(uid):
         return False
-    return int(uid) in get_user_admin_ids()
+    refresh_cache()
+    return int(uid) in CACHE["uadmin_ids_set"]
 
 def is_authorized(uid):
     """Check if user is authorized to use bot"""
-    if is_banned(uid):
-        return False
-    if is_owner(uid):
-        return True
-    if is_co_admin(uid):
-        return True
-    if is_user_admin(uid):
-        return True
     try:
-        cur = db.execute("SELECT user_id FROM authorized_users WHERE user_id =?", (int(uid),))
-        return len(cur.fetchall()) > 0
+        uid_int = int(uid)
+        refresh_access_cache()
+        if uid_int in ACCESS_CACHE["banned_ids"]:
+            return False
+        if is_owner(uid):
+            return True
+        refresh_cache()
+        if uid_int in CACHE["co_ids_set"] or uid_int in CACHE["uadmin_ids_set"]:
+            return True
+        return uid_int in ACCESS_CACHE["authorized_ids"]
     except:
         return False
 
 def get_user_role(uid):
     """Get role string for user"""
-    if is_banned(uid):
-        return "banned"
-    if is_owner(uid):
-        return "owner"
-    if is_co_admin(uid):
-        return "co_admin"
-    if is_user_admin(uid):
-        return "user_admin"
-    if is_authorized(uid):
-        return "normal_user"
-    return "unauthorized"
+    try:
+        uid_int = int(uid)
+        refresh_access_cache()
+        if uid_int in ACCESS_CACHE["banned_ids"]:
+            return "banned"
+        if is_owner(uid):
+            return "owner"
+        refresh_cache()
+        if uid_int in CACHE["co_ids_set"]:
+            return "co_admin"
+        if uid_int in CACHE["uadmin_ids_set"]:
+            return "user_admin"
+        if uid_int in ACCESS_CACHE["authorized_ids"]:
+            return "normal_user"
+        return "unauthorized"
+    except:
+        return "unauthorized"
 
 def ban_user(target_id, banned_by):
     """
@@ -450,11 +520,13 @@ def ban_user(target_id, banned_by):
         "INSERT OR REPLACE INTO banned_users (user_id, banned_by, reason, created_at) VALUES (?,?,?,?)",
         (tid, int(banned_by), "banned by owner", datetime.now(timezone.utc).isoformat())
     )
+    invalidate_access_cache()
     refresh_cache(force=True)
 
 def unban_user(target_id):
     """Unban user"""
     db.execute("DELETE FROM banned_users WHERE user_id =?", (int(target_id),))
+    invalidate_access_cache()
     refresh_cache(force=True)
 
 def get_user_state(uid):
@@ -534,6 +606,16 @@ VIS_OPTIONS = [
     ("👥 Users + Owner Only", "users_owner_only"),
 ]
 
+VIS_LABELS = {val: name for name, val in VIS_OPTIONS}
+
+def format_visibility_mode(btn):
+    """Human readable visibility mode for button detail screens"""
+    vis = btn.get('visibility', 'all') if btn else 'all'
+    label = VIS_LABELS.get(vis, vis)
+    if vis == "specific_uadmin" and btn and btn.get('visible_to_user_id'):
+        return f"{label} (ID:{btn.get('visible_to_user_id')})"
+    return label
+
 # ---------------- VISIBILITY LOGIC - FIXED FOR PUBLIC UADMIN BUTTONS ----------------
 
 def can_view_in_main_menu(uid, btn, role, user_admin_ids):
@@ -601,7 +683,7 @@ def can_view_button(uid, btn, role, user_admin_ids):
     """Compatibility wrapper"""
     return can_view_in_main_menu(uid, btn, role, user_admin_ids)
 
-def get_buttons_paginated_for_user(uid, page):
+def get_buttons_paginated_for_user(uid, page, role=None):
     """Main menu filtered buttons"""
     all_btns = get_all_buttons_cached()
 
@@ -616,13 +698,14 @@ def get_manage_buttons_for_user(uid):
     """Manage list - partition wise"""
     all_btns = get_all_buttons_cached()
 
-    role = get_user_role(uid)
+    role = role or get_user_role(uid)
+    uadmin_id_set = get_user_admin_id_set()
 
     if role == "owner":
-        return [b for b in all_btns if b.get('created_by') not in get_user_admin_ids()]
+        return [b for b in all_btns if b.get('created_by') not in uadmin_id_set]
 
     if role == "co_admin":
-        return [b for b in all_btns if b.get('created_by') not in get_user_admin_ids()]
+        return [b for b in all_btns if b.get('created_by') not in uadmin_id_set]
 
     if role == "user_admin":
         return [b for b in all_btns if b.get('created_by') and int(b.get('created_by')) == int(uid)]
@@ -637,7 +720,7 @@ def can_open_manage_button(uid, btn, role):
     if role == "owner":
         return True
     if role == "co_admin":
-        if created_by and int(created_by) in get_user_admin_ids():
+        if created_by and int(created_by) in get_user_admin_id_set():
             return can_access_button(uid, btn, role, get_user_admin_ids())
         return True
     if role == "user_admin":
@@ -651,7 +734,7 @@ def can_add_files_to_button(uid, btn, role):
     if role == "owner":
         return True
     if role == "co_admin":
-        return not (btn.get('created_by') and int(btn.get('created_by')) in get_user_admin_ids())
+        return not (btn.get('created_by') and int(btn.get('created_by')) in get_user_admin_id_set())
     if role == "user_admin":
         return btn.get('created_by') and int(btn.get('created_by')) == int(uid)
     return False
@@ -663,7 +746,7 @@ def can_edit_button(uid, btn, role):
     if role == "owner":
         return True
     if role == "co_admin":
-        return not is_owner_created_button(btn) and not (btn.get('created_by') and int(btn.get('created_by')) in get_user_admin_ids())
+        return not is_owner_created_button(btn) and not (btn.get('created_by') and int(btn.get('created_by')) in get_user_admin_id_set())
     if role == "user_admin":
         return btn.get('created_by') and int(btn.get('created_by')) == int(uid)
     return False
@@ -693,6 +776,8 @@ async def send_button_files(update, context, button):
             (button['id'],)
         )
         files = cur.fetchall()
+        header = await context.bot.send_message(chat_id, f"Visibility: {format_visibility_mode(button)}")
+        schedule_delete(context.bot, chat_id, header.message_id)
 
         if not files:
             m = await context.bot.send_message(chat_id, f"📭 '{button['name']}' is empty.")
@@ -741,11 +826,12 @@ async def send_button_files(update, context, button):
 async def show_main_menu(update, context, page=0):
     """Show main menu with pagination"""
     uid = update.effective_user.id
-    if is_banned(uid):
+    role = get_user_role(uid)
+    if role == "banned":
         await context.bot.send_message(update.effective_chat.id, "🚫 You are banned by owner.")
         return
 
-    buttons, total = get_buttons_paginated_for_user(uid, page)
+    buttons, total = get_buttons_paginated_for_user(uid, page, role)
     total_pages = max(1, (total + PER_PAGE - 1)//PER_PAGE)
 
     inline_rows = []
@@ -766,7 +852,7 @@ async def show_main_menu(update, context, page=0):
     if pag_row:
         inline_rows.append(pag_row)
 
-    if is_owner(uid) or is_co_admin(uid) or is_user_admin(uid):
+    if role in ("owner", "co_admin", "user_admin"):
         inline_rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel")])
 
     text = f"📂 Main Menu (Page {page+1}/{total_pages}) - {total} buttons\nSelect any button:"
@@ -1002,6 +1088,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.execute("DELETE FROM user_admins WHERE user_id =?", (tid,))
         db.execute("INSERT OR REPLACE INTO co_admins (user_id, added_by, created_at) VALUES (?,?,?)", (tid, int(uid), datetime.now(timezone.utc).isoformat()))
         db.execute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)", (tid, datetime.now(timezone.utc).isoformat()))
+        invalidate_access_cache()
         refresh_cache(force=True)
         await safe_edit(q, f"✅ Promoted {tid} to Co-Admin", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_uadmins")]]))
 
@@ -1011,6 +1098,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.execute("DELETE FROM co_admins WHERE user_id =?", (tid,))
         db.execute("INSERT OR REPLACE INTO user_admins (user_id, nickname, created_by, created_at) VALUES (?,?,?,?)", (tid, f"UAdmin-{tid}", int(uid), datetime.now(timezone.utc).isoformat()))
         db.execute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)", (tid, datetime.now(timezone.utc).isoformat()))
+        invalidate_access_cache()
         refresh_cache(force=True)
         await safe_edit(q, f"✅ Demoted {tid} to UAdmin", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_coadmin")]]))
 
@@ -1063,7 +1151,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if role == "owner":
                 kb.append([InlineKeyboardButton(f"{LOCK_EMOJI} Lock Button", callback_data=f"m_lock_toggle:{bid}")])
         kb.append([InlineKeyboardButton("Back", callback_data="admin_manage_list")])
-        await safe_edit(q, f"Manage Button: {display_button_name(btn)} (ID {bid})", InlineKeyboardMarkup(kb))
+        await safe_edit(q, f"Visibility: {format_visibility_mode(btn)}\nManage Button: {display_button_name(btn)} (ID {bid})", InlineKeyboardMarkup(kb))
 
     elif data.startswith("m_lock_toggle:"):
         if role != "owner":
@@ -1144,7 +1232,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         rows = [[InlineKeyboardButton(name, callback_data=f"m_vis_set:{bid}:{val}")] for name, val in VIS_OPTIONS]
         rows.append([InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")])
-        await safe_edit(q, f"Visibility for {bid}: (Public = All)", InlineKeyboardMarkup(rows))
+        await safe_edit(q, f"Current Visibility: {format_visibility_mode(btn)}\nVisibility for {bid}: (Public = All)", InlineKeyboardMarkup(rows))
 
     elif data.startswith("m_vis_set:"):
         if role == "user_admin": return
@@ -1195,6 +1283,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_uadmin_key = key_input.startswith("UADMIN-") or r[2] == 'uadmin'
             db.execute("UPDATE access_keys SET is_used = 1, used_by =? WHERE key =?", (int(uid), key_input))
             db.execute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)", (int(uid), datetime.now(timezone.utc).isoformat()))
+            invalidate_access_cache()
             if is_uadmin_key:
                 db.execute("INSERT OR REPLACE INTO user_admins (user_id, nickname, created_by, created_at) VALUES (?,?,?,?)", (int(uid), r[1] or f"UAdmin-{uid}", int(OWNER_ID), datetime.now(timezone.utc).isoformat()))
                 refresh_cache(force=True)
@@ -1252,6 +1341,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             nid = int(re.search(r'\d+', text).group())
             db.execute("INSERT OR REPLACE INTO co_admins (user_id, added_by, created_at) VALUES (?,?,?)", (nid, int(uid), datetime.now(timezone.utc).isoformat()))
             db.execute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)", (nid, datetime.now(timezone.utc).isoformat()))
+            invalidate_access_cache()
             refresh_cache(force=True)
             await update.effective_message.reply_text(f"✅ Co-Admin {nid} added")
         except Exception as e:
@@ -1358,12 +1448,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text:
         try:
             all_btns = get_all_buttons_cached()
-            matched = None
-            for b in all_btns:
-                if b['name'].lower().strip() == text.lower().strip() or clean_button_text(b['name']).lower() == clean_button_text(text).lower():
-                    matched = b
-                    break
-            if matched and can_access_button(uid, matched, get_user_role(uid), get_user_admin_ids()):
+            text_lower = text.lower().strip()
+            clean_text_lower = clean_button_text(text).lower()
+            matched = BUTTON_CACHE.get("name_map", {}).get(text_lower) or BUTTON_CACHE.get("name_map", {}).get(clean_text_lower)
+            if not matched:
+                for b in all_btns:
+                    if b.get("_name_lower") == text_lower or b.get("_clean_name_lower") == clean_text_lower:
+                        matched = b
+                        break
+            role = get_user_role(uid)
+            if matched and can_access_button(uid, matched, role, get_user_admin_ids()):
                 await send_button_files(update, context, matched)
         except Exception as e:
             print(e)
