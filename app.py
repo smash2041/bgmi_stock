@@ -529,6 +529,7 @@ VIS_OPTIONS = [
     ("👑 Owner Only", "owner_only"),
     ("🛡 Co-Owner + Owner Only", "coowner_owner"),
     ("👥 All UAdmins Only", "uadmins_only"),
+    ("👥 UAdmins + Co-Owner", "uadmins_coowner"),
     ("👤 Specific UAdmin Only", "specific_uadmin"),
     ("👥 Users + Owner Only", "users_owner_only"),
 ]
@@ -538,30 +539,25 @@ VIS_OPTIONS = [
 def can_view_in_main_menu(uid, btn, role, user_admin_ids):
     """
     FIXED LOGIC:
-    - Owner main menu me private UAdmin buttons hide, public wale show
-    - Normal user ko UAdmin ka button sirf tab dikhega jab visibility = all ho
+    - Public means everyone
+    - Owner ke set kiye visibility role ke hisab se button dikhega
     """
-    created_by = btn.get('created_by')
     vis = btn.get('visibility', 'all')
-    is_uadmin_btn = created_by and int(created_by) in user_admin_ids
 
     if role == "owner":
-        if is_uadmin_btn and vis!= "all":
-            return False
         return True
 
     if role == "co_admin":
-        if is_uadmin_btn and vis!= "all":
-            return False
-        return vis in ("all", "coowner_owner")
+        return vis in ("all", "coowner_owner", "uadmins_coowner")
 
     if role == "user_admin":
-        # UAdmin ko sirf apna partition dikhega
-        return created_by and int(created_by) == int(uid)
+        if vis in ("all", "uadmins_only", "uadmins_coowner"):
+            return True
+        if vis == "specific_uadmin":
+            return btn.get('visible_to_user_id') and int(btn.get('visible_to_user_id')) == int(uid)
+        return False
 
     if role == "normal_user":
-        if is_uadmin_btn:
-            return vis == "all"
         return vis in ("all", "users_owner_only")
 
     return False
@@ -577,22 +573,18 @@ def can_access_button(uid, btn, role, user_admin_ids):
 
     if role == "co_admin":
         vis = btn.get('visibility', 'all')
-        created_by = btn.get('created_by')
-        is_uadmin_btn = created_by and int(created_by) in user_admin_ids
-        if is_uadmin_btn and vis != "all":
-            return False
-        return vis in ("all", "coowner_owner")
+        return vis in ("all", "coowner_owner", "uadmins_coowner")
 
     if role == "user_admin":
-        return btn.get('created_by') and int(btn.get('created_by')) == int(uid)
+        vis = btn.get('visibility', 'all')
+        if vis in ("all", "uadmins_only", "uadmins_coowner"):
+            return True
+        if vis == "specific_uadmin":
+            return btn.get('visible_to_user_id') and int(btn.get('visible_to_user_id')) == int(uid)
+        return False
 
     if role == "normal_user":
         vis = btn.get('visibility', 'all')
-        created_by = btn.get('created_by')
-        is_uadmin_btn = created_by and int(created_by) in user_admin_ids
-
-        if is_uadmin_btn:
-            return vis == "all"
 
         if vis == "all":
             return True
@@ -645,7 +637,9 @@ def can_open_manage_button(uid, btn, role):
     if role == "owner":
         return True
     if role == "co_admin":
-        return not (created_by and int(created_by) in get_user_admin_ids())
+        if created_by and int(created_by) in get_user_admin_ids():
+            return can_access_button(uid, btn, role, get_user_admin_ids())
+        return True
     if role == "user_admin":
         return created_by and int(created_by) == int(uid)
     return False
