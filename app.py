@@ -592,7 +592,7 @@ def schedule_delete_30(bot, chat_id, message_id):
 
 def build_inline_button(btn):
     """Build inline button from db row"""
-    return InlineKeyboardButton(text=display_button_name(btn), callback_data=f"view_btn:{btn['id']}:0")
+    return InlineKeyboardButton(text=display_button_name(btn), callback_data=f"open_btn:{btn['id']}:0")
 
 PER_PAGE = 15
 
@@ -757,6 +757,35 @@ def can_change_visibility(uid, btn, role):
         return False
     return can_edit_button(uid, btn, role)
 
+async def show_manage_button_menu(update, context, bid, role=None, back_callback="admin_manage_list"):
+    """Show button management actions from admin panel or direct main-menu click"""
+    q = update.callback_query
+    uid = update.effective_user.id
+    role = role or get_user_role(uid)
+    btn = get_button_by_id(bid)
+    if not btn:
+        return
+    if not can_open_manage_button(uid, btn, role):
+        await safe_edit(q, "Access denied")
+        return
+
+    kb = [[InlineKeyboardButton("\U0001F441 View Files / Data", callback_data=f"view_btn:{bid}:0")]]
+    if is_locked_button(btn):
+        if role == "owner":
+            kb.append([InlineKeyboardButton("\U0001F513 Unlock Button", callback_data=f"m_lock_toggle:{bid}")])
+    else:
+        if can_add_files_to_button(uid, btn, role):
+            kb.append([InlineKeyboardButton("\U0001F4E4 Add Files", callback_data=f"m_addfile:{bid}")])
+        if can_edit_button(uid, btn, role):
+            kb.append([InlineKeyboardButton("\U0001F4C4 List/Delete Files", callback_data=f"m_listfiles:{bid}")])
+            if can_change_visibility(uid, btn, role):
+                kb.append([InlineKeyboardButton("\U0001F441 Visibility", callback_data=f"m_vis:{bid}")])
+            kb.append([InlineKeyboardButton("\U0000274C Delete Button", callback_data=f"m_delbtn:{bid}")])
+        if role == "owner":
+            kb.append([InlineKeyboardButton(f"{LOCK_EMOJI} Lock Button", callback_data=f"m_lock_toggle:{bid}")])
+    kb.append([InlineKeyboardButton("Back", callback_data=back_callback)])
+    await safe_edit(q, f"Visibility: {format_visibility_mode(btn)}\nManage Button: {display_button_name(btn)} (ID {bid})", InlineKeyboardMarkup(kb))
+
 # ---------------- FILE SENDER - NO FORWARD TAG + BACKUP FALLBACK ----------------
 
 async def send_button_files(update, context, button):
@@ -853,6 +882,7 @@ async def show_main_menu(update, context, page=0):
         inline_rows.append(pag_row)
 
     if role in ("owner", "co_admin", "user_admin"):
+        inline_rows.append([InlineKeyboardButton("➕ Create New Button", callback_data="admin_add_button")])
         inline_rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel")])
 
     text = f"📂 Main Menu (Page {page+1}/{total_pages}) - {total} buttons\nSelect any button:"
@@ -935,7 +965,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-    if data.startswith("view_btn:"):
+    if data.startswith("open_btn:"):
+        _, bid, _ = data.split(":")
+        btn = get_button_by_id(bid)
+        if not btn:
+            return
+        if not can_access_button(uid, btn, role, get_user_admin_ids()):
+            return
+        if role in ("owner", "co_admin", "user_admin") and can_open_manage_button(uid, btn, role):
+            await show_manage_button_menu(update, context, int(bid), role, "main_page:0")
+            return
+        await send_button_files(update, context, btn)
+
+    elif data.startswith("view_btn:"):
         _, bid, _ = data.split(":")
         btn = get_button_by_id(bid)
         if not btn:
@@ -1130,28 +1172,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("manage_btn:"):
         bid = int(data.split(":")[1])
-        btn = get_button_by_id(bid)
-        if not btn:
-            return
-        if not can_open_manage_button(uid, btn, role):
-            await safe_edit(q, "Access denied")
-            return
-        kb = [[InlineKeyboardButton("\U0001F441 View Files / Data", callback_data=f"view_btn:{bid}:0")]]
-        if is_locked_button(btn):
-            if role == "owner":
-                kb.append([InlineKeyboardButton("\U0001F513 Unlock Button", callback_data=f"m_lock_toggle:{bid}")])
-        else:
-            if can_add_files_to_button(uid, btn, role):
-                kb.append([InlineKeyboardButton("\U0001F4E4 Add Files", callback_data=f"m_addfile:{bid}")])
-            if can_edit_button(uid, btn, role):
-                kb.append([InlineKeyboardButton("\U0001F4C4 List/Delete Files", callback_data=f"m_listfiles:{bid}")])
-                if can_change_visibility(uid, btn, role):
-                    kb.append([InlineKeyboardButton("\U0001F441 Visibility", callback_data=f"m_vis:{bid}")])
-                kb.append([InlineKeyboardButton("\U0000274C Delete Button", callback_data=f"m_delbtn:{bid}")])
-            if role == "owner":
-                kb.append([InlineKeyboardButton(f"{LOCK_EMOJI} Lock Button", callback_data=f"m_lock_toggle:{bid}")])
-        kb.append([InlineKeyboardButton("Back", callback_data="admin_manage_list")])
-        await safe_edit(q, f"Visibility: {format_visibility_mode(btn)}\nManage Button: {display_button_name(btn)} (ID {bid})", InlineKeyboardMarkup(kb))
+        await show_manage_button_menu(update, context, bid, role, "admin_manage_list")
 
     elif data.startswith("m_lock_toggle:"):
         if role != "owner":
