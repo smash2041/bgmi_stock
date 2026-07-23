@@ -687,7 +687,7 @@ def get_buttons_paginated_for_user(uid, page, role=None):
     """Main menu filtered buttons"""
     all_btns = get_all_buttons_cached()
 
-    role = get_user_role(uid)
+    role = role or get_user_role(uid)
     user_admin_ids = get_user_admin_ids()
     filtered = [b for b in all_btns if can_view_in_main_menu(uid, b, role, user_admin_ids)]
     total = len(filtered)
@@ -698,7 +698,7 @@ def get_manage_buttons_for_user(uid):
     """Manage list - partition wise"""
     all_btns = get_all_buttons_cached()
 
-    role = role or get_user_role(uid)
+    role = get_user_role(uid)
     uadmin_id_set = get_user_admin_id_set()
 
     if role == "owner":
