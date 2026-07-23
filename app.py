@@ -212,8 +212,15 @@ def init_db():
         color TEXT,
         emoji TEXT,
         created_by INTEGER,
-        visible_to_user_id INTEGER
+        visible_to_user_id INTEGER,
+        locked INTEGER DEFAULT 0
     )""")
+
+    try:
+        db.execute("ALTER TABLE buttons ADD COLUMN locked INTEGER DEFAULT 0")
+    except Exception as e:
+        if "duplicate" not in str(e).lower() and "already exists" not in str(e).lower():
+            print(f"locked column migration skipped: {e}")
 
     db.execute("""CREATE TABLE IF NOT EXISTS button_files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -263,13 +270,18 @@ CACHE = {
     "ts": 0
 }
 
+BUTTON_CACHE = {
+    "buttons": [],
+    "ts": 0
+}
+
 def refresh_cache(force=False):
     """
     Refresh co_admin and uadmin cache every 30 sec for speed.
     Reduces Turso HTTP calls from 4-5 per click to 0.
     """
     now = time.time()
-    if not force and now - CACHE["ts"] < 30 and CACHE["uadmins"]:
+    if not force and now - CACHE["ts"] < 30:
         return
     try:
         cur = db.execute("SELECT user_id FROM co_admins")
@@ -300,6 +312,63 @@ def get_user_admin_ids():
         return [int(x['user_id']) for x in get_all_user_admins()]
     except:
         return []
+
+def invalidate_button_cache():
+    """Clear button cache after any button/file/visibility change"""
+    BUTTON_CACHE["buttons"] = []
+    BUTTON_CACHE["ts"] = 0
+
+LOCK_EMOJI = "\U0001F512"
+
+def is_locked_button(btn):
+    """True if button is owner-locked"""
+    try:
+        return int(btn.get('locked') or 0) == 1
+    except:
+        return False
+
+def display_button_name(btn):
+    """Show lock emoji with button name without changing stored name"""
+    name = btn.get('name') or ""
+    if is_locked_button(btn) and LOCK_EMOJI not in name:
+        return f"{name} {LOCK_EMOJI}"
+    return name
+
+def is_owner_created_button(btn):
+    """Treat legacy buttons without creator as owner buttons"""
+    created_by = btn.get('created_by')
+    return created_by is None or is_owner(created_by)
+
+def get_button_by_id(bid):
+    """Fetch one button with lock metadata"""
+    try:
+        cur = db.execute(
+            "SELECT id, name, visibility, created_by, visible_to_user_id, locked FROM buttons WHERE id =?",
+            (int(bid),)
+        )
+        r = cur.fetchone()
+        if not r:
+            return None
+        return {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4], "locked": r[5]}
+    except Exception as e:
+        print(f"get_button_by_id error {e}")
+        return None
+
+def get_all_buttons_cached(force=False):
+    """Small cache for button lists/text matching to reduce Turso HTTP clicks"""
+    now = time.time()
+    if not force and now - BUTTON_CACHE["ts"] < 8:
+        return BUTTON_CACHE["buttons"]
+    try:
+        cur = db.execute("SELECT id, name, visibility, created_by, visible_to_user_id, locked FROM buttons ORDER BY name COLLATE NOCASE")
+        BUTTON_CACHE["buttons"] = [
+            {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4], "locked": r[5]}
+            for r in cur.fetchall()
+        ]
+        BUTTON_CACHE["ts"] = now
+    except Exception as e:
+        print(f"button cache error {e}")
+    return BUTTON_CACHE["buttons"]
 
 # =============================================================================
 # HELPER FUNCTIONS - SAME AS YOUR OLD 950 LINE CODE
@@ -451,7 +520,7 @@ def schedule_delete_30(bot, chat_id, message_id):
 
 def build_inline_button(btn):
     """Build inline button from db row"""
-    return InlineKeyboardButton(text=btn['name'], callback_data=f"view_btn:{btn['id']}:0")
+    return InlineKeyboardButton(text=display_button_name(btn), callback_data=f"view_btn:{btn['id']}:0")
 
 PER_PAGE = 15
 
@@ -484,7 +553,7 @@ def can_view_in_main_menu(uid, btn, role, user_admin_ids):
     if role == "co_admin":
         if is_uadmin_btn and vis!= "all":
             return False
-        return True
+        return vis in ("all", "coowner_owner")
 
     if role == "user_admin":
         # UAdmin ko sirf apna partition dikhega
@@ -500,11 +569,19 @@ def can_view_in_main_menu(uid, btn, role, user_admin_ids):
 def can_access_button(uid, btn, role, user_admin_ids):
     """
     FIXED LOGIC:
-    Owner/Co-Owner hamesha data dekh payega
+    Owner hamesha data dekh payega, Co-Owner visibility ke hisab se
     Privacy ke hisab se normal user dekh payega
     """
-    if role in ("owner", "co_admin"):
+    if role == "owner":
         return True
+
+    if role == "co_admin":
+        vis = btn.get('visibility', 'all')
+        created_by = btn.get('created_by')
+        is_uadmin_btn = created_by and int(created_by) in user_admin_ids
+        if is_uadmin_btn and vis != "all":
+            return False
+        return vis in ("all", "coowner_owner")
 
     if role == "user_admin":
         return btn.get('created_by') and int(btn.get('created_by')) == int(uid)
@@ -534,15 +611,7 @@ def can_view_button(uid, btn, role, user_admin_ids):
 
 def get_buttons_paginated_for_user(uid, page):
     """Main menu filtered buttons"""
-    try:
-        cur = db.execute("SELECT id, name, visibility, created_by, visible_to_user_id FROM buttons ORDER BY name COLLATE NOCASE")
-        all_btns = [
-            {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4]}
-            for r in cur.fetchall()
-        ]
-    except Exception as e:
-        print(f"get_buttons error {e}")
-        return [], 0
+    all_btns = get_all_buttons_cached()
 
     role = get_user_role(uid)
     user_admin_ids = get_user_admin_ids()
@@ -553,11 +622,7 @@ def get_buttons_paginated_for_user(uid, page):
 
 def get_manage_buttons_for_user(uid):
     """Manage list - partition wise"""
-    try:
-        cur = db.execute("SELECT id, name, visibility, created_by FROM buttons ORDER BY name COLLATE NOCASE")
-        all_btns = [{"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3]} for r in cur.fetchall()]
-    except:
-        return []
+    all_btns = get_all_buttons_cached()
 
     role = get_user_role(uid)
 
@@ -571,6 +636,49 @@ def get_manage_buttons_for_user(uid):
         return [b for b in all_btns if b.get('created_by') and int(b.get('created_by')) == int(uid)]
 
     return []
+
+def can_open_manage_button(uid, btn, role):
+    """Who can open manage screen for a button"""
+    if not btn:
+        return False
+    created_by = btn.get('created_by')
+    if role == "owner":
+        return True
+    if role == "co_admin":
+        return not (created_by and int(created_by) in get_user_admin_ids())
+    if role == "user_admin":
+        return created_by and int(created_by) == int(uid)
+    return False
+
+def can_add_files_to_button(uid, btn, role):
+    """Co-owner can add files to owner buttons, but locked buttons cannot be edited"""
+    if not can_open_manage_button(uid, btn, role) or is_locked_button(btn):
+        return False
+    if role == "owner":
+        return True
+    if role == "co_admin":
+        return not (btn.get('created_by') and int(btn.get('created_by')) in get_user_admin_ids())
+    if role == "user_admin":
+        return btn.get('created_by') and int(btn.get('created_by')) == int(uid)
+    return False
+
+def can_edit_button(uid, btn, role):
+    """Delete/edit permissions for button settings and files"""
+    if not can_open_manage_button(uid, btn, role) or is_locked_button(btn):
+        return False
+    if role == "owner":
+        return True
+    if role == "co_admin":
+        return not is_owner_created_button(btn) and not (btn.get('created_by') and int(btn.get('created_by')) in get_user_admin_ids())
+    if role == "user_admin":
+        return btn.get('created_by') and int(btn.get('created_by')) == int(uid)
+    return False
+
+def can_change_visibility(uid, btn, role):
+    """Only owner/co-owner can change visibility, never UAdmin"""
+    if role == "user_admin":
+        return False
+    return can_edit_button(uid, btn, role)
 
 # ---------------- FILE SENDER - NO FORWARD TAG + BACKUP FALLBACK ----------------
 
@@ -749,11 +857,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("view_btn:"):
         _, bid, _ = data.split(":")
-        cur = db.execute("SELECT id, name, visibility, created_by, visible_to_user_id FROM buttons WHERE id =?", (int(bid),))
-        r = cur.fetchone()
-        if not r:
+        btn = get_button_by_id(bid)
+        if not btn:
             return
-        btn = {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4]}
         if not can_access_button(uid, btn, role, get_user_admin_ids()):
             return
         await send_button_files(update, context, btn)
@@ -779,6 +885,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         try:
             db.execute("INSERT INTO buttons (name, visibility, btn_type, created_by) VALUES (?,?, 'callback',?)", (st['data']['name'], vis, int(uid)))
+            invalidate_button_cache()
             await safe_edit(q, f"✅ Button '{st['data']['name']}' created! Vis: {vis}")
         except Exception as e:
             await safe_edit(q, f"❌ Exists: {e}")
@@ -791,6 +898,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not st:
             return
         db.execute("INSERT INTO buttons (name, visibility, btn_type, created_by, visible_to_user_id) VALUES (?, 'specific_uadmin', 'callback',?,?)", (st['data']['name'], int(uid), target_id))
+        invalidate_button_cache()
         await safe_edit(q, f"✅ Created for UAdmin {target_id}")
         clear_user_state(uid)
         await show_main_menu(update, context, 0)
@@ -821,7 +929,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await safe_edit(q, "No buttons", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
                 return
-            rows = [[InlineKeyboardButton(b['name'], callback_data=f"manage_btn:{b['id']}")] for b in btns[:30]]
+            rows = [[InlineKeyboardButton(display_button_name(b), callback_data=f"manage_btn:{b['id']}")] for b in btns[:30]]
             rows.append([InlineKeyboardButton("Back", callback_data="admin_panel")])
             await safe_edit(q, "🗂 Your Buttons (Partition):", InlineKeyboardMarkup(rows))
         elif data == "admin_add_coadmin":
@@ -875,12 +983,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("uadmin_view_buttons:"):
         tid = int(data.split(":")[1])
-        cur = db.execute("SELECT id, name, visibility FROM buttons WHERE created_by =?", (tid,))
+        cur = db.execute("SELECT id, name, visibility, locked FROM buttons WHERE created_by =?", (tid,))
         rows = cur.fetchall()
         if not rows:
             await safe_edit(q, f"No buttons by UAdmin {tid}", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"uadmin_view:{tid}")]]))
             return
-        kb = [[InlineKeyboardButton(f"{r[1]} [{r[2]}]", callback_data=f"manage_btn:{r[0]}")] for r in rows[:30]]
+        kb = [[InlineKeyboardButton(f"{display_button_name({'name': r[1], 'locked': r[3]})} [{r[2]}]", callback_data=f"manage_btn:{r[0]}")] for r in rows[:30]]
         kb.append([InlineKeyboardButton("Back", callback_data=f"uadmin_view:{tid}")])
         await safe_edit(q, f"Buttons by UAdmin {tid} - Owner view (click to see data):", InlineKeyboardMarkup(kb))
 
@@ -940,43 +1048,50 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("manage_btn:"):
         bid = int(data.split(":")[1])
-        cur = db.execute("SELECT created_by, name FROM buttons WHERE id =?", (bid,))
-        r = cur.fetchone()
-        if not r: return
-        c_by, b_name = r[0], r[1]
-        if role == "user_admin" and c_by and int(c_by)!= int(uid):
-            await safe_edit(q, "❌ Sirf apna button")
+        btn = get_button_by_id(bid)
+        if not btn:
             return
-        if role in ("owner", "co_admin") and c_by and int(c_by) in get_user_admin_ids():
-            kb = [
-                [InlineKeyboardButton("👁 View Files / Data", callback_data=f"view_btn:{bid}:0")],
-                [InlineKeyboardButton("📤 Add Files", callback_data=f"m_addfile:{bid}")],
-                [InlineKeyboardButton("📄 List/Delete Files", callback_data=f"m_listfiles:{bid}")],
-                [InlineKeyboardButton("👁 Visibility (Set Public)", callback_data=f"m_vis:{bid}")],
-                [InlineKeyboardButton("❌ Delete Button", callback_data=f"m_delbtn:{bid}")],
-                [InlineKeyboardButton("Back", callback_data="admin_manage_list")]
-            ]
-        elif role == "user_admin":
-            kb = [
-                [InlineKeyboardButton("👁 View My Files", callback_data=f"view_btn:{bid}:0")],
-                [InlineKeyboardButton("📤 Add Files", callback_data=f"m_addfile:{bid}")],
-                [InlineKeyboardButton("📄 List/Delete Files", callback_data=f"m_listfiles:{bid}")],
-                [InlineKeyboardButton("❌ Delete Button", callback_data=f"m_delbtn:{bid}")],
-                [InlineKeyboardButton("Back", callback_data="admin_manage_list")]
-            ]
+        if not can_open_manage_button(uid, btn, role):
+            await safe_edit(q, "Access denied")
+            return
+        kb = [[InlineKeyboardButton("\U0001F441 View Files / Data", callback_data=f"view_btn:{bid}:0")]]
+        if is_locked_button(btn):
+            if role == "owner":
+                kb.append([InlineKeyboardButton("\U0001F513 Unlock Button", callback_data=f"m_lock_toggle:{bid}")])
         else:
-            kb = [
-                [InlineKeyboardButton("👁 View Files", callback_data=f"view_btn:{bid}:0")],
-                [InlineKeyboardButton("📤 Add Files", callback_data=f"m_addfile:{bid}")],
-                [InlineKeyboardButton("📄 List/Delete Files", callback_data=f"m_listfiles:{bid}")],
-                [InlineKeyboardButton("👁 Visibility", callback_data=f"m_vis:{bid}")],
-                [InlineKeyboardButton("❌ Delete Button", callback_data=f"m_delbtn:{bid}")],
-                [InlineKeyboardButton("Back", callback_data="admin_manage_list")]
-            ]
-        await safe_edit(q, f"Manage Button: {b_name} (ID {bid})", InlineKeyboardMarkup(kb))
+            if can_add_files_to_button(uid, btn, role):
+                kb.append([InlineKeyboardButton("\U0001F4E4 Add Files", callback_data=f"m_addfile:{bid}")])
+            if can_edit_button(uid, btn, role):
+                kb.append([InlineKeyboardButton("\U0001F4C4 List/Delete Files", callback_data=f"m_listfiles:{bid}")])
+                if can_change_visibility(uid, btn, role):
+                    kb.append([InlineKeyboardButton("\U0001F441 Visibility", callback_data=f"m_vis:{bid}")])
+                kb.append([InlineKeyboardButton("\U0000274C Delete Button", callback_data=f"m_delbtn:{bid}")])
+            if role == "owner":
+                kb.append([InlineKeyboardButton(f"{LOCK_EMOJI} Lock Button", callback_data=f"m_lock_toggle:{bid}")])
+        kb.append([InlineKeyboardButton("Back", callback_data="admin_manage_list")])
+        await safe_edit(q, f"Manage Button: {display_button_name(btn)} (ID {bid})", InlineKeyboardMarkup(kb))
+
+    elif data.startswith("m_lock_toggle:"):
+        if role != "owner":
+            return
+        bid = int(data.split(":")[1])
+        btn = get_button_by_id(bid)
+        if not btn:
+            return
+        new_locked = 0 if is_locked_button(btn) else 1
+        db.execute("UPDATE buttons SET locked =? WHERE id =?", (new_locked, bid))
+        invalidate_button_cache()
+        btn["locked"] = new_locked
+        status = "locked" if new_locked else "unlocked"
+        await safe_edit(q, f"Button {display_button_name(btn)} {status}", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
 
     elif data.startswith("m_addfile:"):
-        set_user_state(uid, "awaiting_file_upload", {"button_id": int(data.split(":")[1]), "upload_msg_ids": [q.message.message_id]})
+        bid = int(data.split(":")[1])
+        btn = get_button_by_id(bid)
+        if not can_add_files_to_button(uid, btn, role):
+            await safe_edit(q, "Locked or not allowed")
+            return
+        set_user_state(uid, "awaiting_file_upload", {"button_id": bid, "upload_msg_ids": [q.message.message_id]})
         await safe_edit(q, f"📤 Send files for {data.split(':')[1]}. Done dabao.", InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="m_done_upload")]]))
 
     elif data == "m_done_upload":
@@ -992,6 +1107,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("m_listfiles:"):
         bid = int(data.split(":")[1])
+        btn = get_button_by_id(bid)
+        if not can_edit_button(uid, btn, role):
+            await safe_edit(q, "Locked or not allowed")
+            return
         cur = db.execute("SELECT id, file_type FROM button_files WHERE button_id =?", (bid,))
         rows = cur.fetchall()
         if not rows:
@@ -1003,12 +1122,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("m_delfile:"):
         _, fid, bid = data.split(":")
+        btn = get_button_by_id(bid)
+        if not can_edit_button(uid, btn, role):
+            await safe_edit(q, "Locked or not allowed")
+            return
         db.execute("DELETE FROM button_files WHERE id =?", (int(fid),))
         await safe_edit(q, "Deleted", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
 
     elif data.startswith("m_delbtn:"):
         bid = int(data.split(":")[1])
+        btn = get_button_by_id(bid)
+        if not can_edit_button(uid, btn, role):
+            await safe_edit(q, "Locked or not allowed")
+            return
         db.execute("DELETE FROM buttons WHERE id =?", (bid,))
+        invalidate_button_cache()
         await safe_edit(q, "✅ Deleted")
 
     elif data.startswith("m_vis:"):
@@ -1016,6 +1144,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(q, "❌ UAdmin ko visibility change nahi milega")
             return
         bid = int(data.split(":")[1])
+        btn = get_button_by_id(bid)
+        if not can_change_visibility(uid, btn, role):
+            await safe_edit(q, "Locked or not allowed")
+            return
         rows = [[InlineKeyboardButton(name, callback_data=f"m_vis_set:{bid}:{val}")] for name, val in VIS_OPTIONS]
         rows.append([InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")])
         await safe_edit(q, f"Visibility for {bid}: (Public = All)", InlineKeyboardMarkup(rows))
@@ -1024,6 +1156,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if role == "user_admin": return
         _, bid, vis = data.split(":")
         bid = int(bid)
+        btn = get_button_by_id(bid)
+        if not can_change_visibility(uid, btn, role):
+            await safe_edit(q, "Locked or not allowed")
+            return
         if vis == "specific_uadmin":
             uadmins = get_all_user_admins()
             rows = [[InlineKeyboardButton(f"{ua['nickname']} (ID:{ua['user_id']})", callback_data=f"m_vis_specific:{bid}:{ua['user_id']}")] for ua in uadmins]
@@ -1031,11 +1167,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(q, "Select UAdmin:", InlineKeyboardMarkup(rows))
             return
         db.execute("UPDATE buttons SET visibility =?, visible_to_user_id = NULL WHERE id =?", (vis, bid))
+        invalidate_button_cache()
         await safe_edit(q, f"Vis -> {vis} (All = public)", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
 
     elif data.startswith("m_vis_specific:"):
         _, bid, target_id = data.split(":")
+        btn = get_button_by_id(bid)
+        if not can_change_visibility(uid, btn, role):
+            await safe_edit(q, "Locked or not allowed")
+            return
         db.execute("UPDATE buttons SET visibility = 'specific_uadmin', visible_to_user_id =? WHERE id =?", (int(target_id), int(bid)))
+        invalidate_button_cache()
         await safe_edit(q, f"Vis -> Specific UAdmin {target_id}", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
 
 # ---------------- MESSAGE HANDLER ----------------
@@ -1098,6 +1240,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if role == "user_admin":
             try:
                 db.execute("INSERT INTO buttons (name, visibility, btn_type, created_by, visible_to_user_id) VALUES (?, 'specific_uadmin', 'callback',?,?)", (text, int(uid), int(uid)))
+                invalidate_button_cache()
                 await update.effective_message.reply_text(f"✅ Button '{text}' created in your private partition!")
             except Exception as e:
                 await update.effective_message.reply_text(f"❌ Exists: {e}")
@@ -1150,6 +1293,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state == "awaiting_file_upload":
         bid = sdata.get('button_id')
+        btn = get_button_by_id(bid)
+        role = get_user_role(uid)
+        if not can_add_files_to_button(uid, btn, role):
+            clear_user_state(uid)
+            await update.effective_message.reply_text("Locked or not allowed")
+            return
         upload_ids = sdata.get('upload_msg_ids', [])
         if text == "✅ Done":
             for mid in upload_ids:
@@ -1214,8 +1363,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text:
         try:
-            cur = db.execute("SELECT id, name, visibility, created_by, visible_to_user_id FROM buttons")
-            all_btns = [{"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4]} for r in cur.fetchall()]
+            all_btns = get_all_buttons_cached()
             matched = None
             for b in all_btns:
                 if b['name'].lower().strip() == text.lower().strip() or clean_button_text(b['name']).lower() == clean_button_text(text).lower():
