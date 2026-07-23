@@ -574,7 +574,7 @@ def generate_uadmin_key():
 
 # ---------------- Auto delete helpers ----------------
 
-async def auto_delete_message(bot, chat_id, message_id, delay=15):
+async def auto_delete_message(bot, chat_id, message_id, delay=60):
     """Delete message after delay"""
     await asyncio.sleep(delay)
     try:
@@ -584,11 +584,11 @@ async def auto_delete_message(bot, chat_id, message_id, delay=15):
 
 def schedule_delete(bot, chat_id, message_id):
     """Schedule delete after 15 sec - for files"""
-    asyncio.create_task(auto_delete_message(bot, chat_id, message_id, 15))
+    asyncio.create_task(auto_delete_message(bot, chat_id, message_id, 60))
 
 def schedule_delete_30(bot, chat_id, message_id):
     """Schedule delete after 30 sec - for upload msgs"""
-    asyncio.create_task(auto_delete_message(bot, chat_id, message_id, 30))
+    asyncio.create_task(auto_delete_message(bot, chat_id, message_id, 5))
 
 def build_inline_button(btn):
     """Build inline button from db row"""
