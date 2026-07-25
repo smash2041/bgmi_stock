@@ -604,6 +604,7 @@ PDF_MERGE_TYPES = {"text", "photo", "pdf"}
 PDF_PAGE_W = 595.28
 PDF_PAGE_H = 841.89
 PDF_MARGIN = 42
+MAX_LEGACY_DOCUMENT_SCAN_MB = int(os.getenv("MAX_LEGACY_DOCUMENT_SCAN_MB", "50") or "50")
 
 def safe_pdf_filename(button_name, bid):
     """Make Telegram-safe PDF filename from button name."""
@@ -790,6 +791,19 @@ def looks_like_pdf_path(path):
     except:
         return False
 
+def should_scan_legacy_document_pdf(tg_file):
+    """Allow old document rows to be checked as PDFs without pulling very large apk/zip files."""
+    tg_path = (getattr(tg_file, "file_path", "") or "").lower()
+    if ".pdf" in tg_path:
+        return True
+    try:
+        size = int(getattr(tg_file, "file_size", 0) or 0)
+    except:
+        size = 0
+    if not size:
+        return True
+    return size <= MAX_LEGACY_DOCUMENT_SCAN_MB * 1024 * 1024
+
 def _jpeg_info(path):
     with open(path, "rb") as f:
         data = f.read(2)
@@ -973,13 +987,18 @@ async def refresh_button_pdf_backup(context, bid, btn=None):
                 elif ftype in ("pdf", "document") and file_id:
                     try:
                         tg_file = await context.bot.get_file(file_id)
-                        tg_path = (getattr(tg_file, "file_path", "") or "").lower()
-                        if ftype != "pdf" and ".pdf" not in tg_path:
+                        if ftype == "document" and not should_scan_legacy_document_pdf(tg_file):
+                            print(f"legacy document pdf scan skipped for button {bid} file {_fid}: file too large")
                             continue
                         source_pdf = os.path.join(tmpdir, f"source_{idx}.pdf")
                         await tg_file.download_to_drive(custom_path=source_pdf)
                         if looks_like_pdf_path(source_pdf):
                             pdf_parts.append(source_pdf)
+                            if ftype == "document":
+                                try:
+                                    db.execute("UPDATE button_files SET file_type = 'pdf' WHERE id =?", (int(_fid),))
+                                except Exception as e:
+                                    print(f"legacy pdf type update skipped {e}")
                     except Exception as e:
                         print(f"uploaded pdf download skipped {e}")
 
