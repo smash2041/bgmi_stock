@@ -623,6 +623,106 @@ def schedule_delete_30(bot, chat_id, message_id):
     """Schedule delete after 30 sec - for upload msgs"""
     asyncio.create_task(auto_delete_message(bot, chat_id, message_id, 5))
 
+# =============================================================================
+# UPLOAD CONFIRM DEBOUNCE - FIX FOR MULTIPLE "DONE" BUTTON SPAM
+# =============================================================================
+# Jab user ek sath bahut saari files bhejta hai, pehle har file ke baad ek
+# alag "✅ Done" button wala message jaata tha -> spam + Telegram
+# flood-control errors ka risk (especially free Render tier par).
+# Ab har file ke baad turant message nahi bhejte, balki thoda wait (1.5 sec)
+# karte hai - agar usi dauraan aur file aa jaye to purana wait cancel karke
+# fresh wait shuru hota hai. Jab burst khatam ho jata hai (yani 1.5 sec tak
+# koi nayi file nahi aati), tab EK hi combined confirmation + Done button
+# bheja jata hai.
+PENDING_UPLOAD_CONFIRM = {}
+
+# Same tarah, PDF backup bhi ek burst me bar bar rebuild nahi hoga - burst
+# khatam hone ke 2 sec baad sirf ek baar rebuild hoga (sabhi current files
+# ke sath), jisse Turso + Telegram calls kaafi kam ho jaati hai.
+PENDING_PDF_REBUILD = {}
+
+def cancel_pending_upload_confirm(uid):
+    """Done dabne par pending debounce-confirmation cancel kar do taaki
+    Done click ke baad koi extra message na aaye."""
+    info = PENDING_UPLOAD_CONFIRM.pop(uid, None)
+    if info and info.get('task'):
+        try:
+            info['task'].cancel()
+        except Exception:
+            pass
+
+def schedule_upload_confirm(context, uid, chat_id, file_type, backup_ok):
+    """Debounced confirmation - multiple fast uploads ke baad sirf EK
+    message + EK Done button bhejta hai, individual per-file message nahi."""
+    info = PENDING_UPLOAD_CONFIRM.get(uid)
+    if info and info.get('task'):
+        try:
+            info['task'].cancel()
+        except Exception:
+            pass
+    else:
+        info = {"count": 0, "backup_yes": 0, "backup_no": 0}
+
+    info['count'] += 1
+    if backup_ok:
+        info['backup_yes'] += 1
+    else:
+        info['backup_no'] += 1
+    info['last_type'] = file_type
+
+    async def _send_confirm():
+        try:
+            await asyncio.sleep(1.5)
+        except asyncio.CancelledError:
+            return
+        data = PENDING_UPLOAD_CONFIRM.get(uid)
+        if not data:
+            return
+        PENDING_UPLOAD_CONFIRM.pop(uid, None)
+        if data['count'] <= 1:
+            text = f"✅ Added {data['last_type']} Backup:{'Yes' if data['backup_yes'] else 'No'}"
+        else:
+            text = f"✅ Added {data['count']} files (Backup Yes:{data['backup_yes']} No:{data['backup_no']})"
+        kb_done = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="m_done_upload")]])
+        try:
+            m = await context.bot.send_message(chat_id, text, reply_markup=kb_done)
+            st = await get_user_state(uid)
+            if st and st.get('state') == "awaiting_file_upload":
+                sdata2 = st['data']
+                upload_ids = sdata2.get('upload_msg_ids', [])
+                upload_ids.append(m.message_id)
+                sdata2['upload_msg_ids'] = upload_ids
+                await set_user_state(uid, "awaiting_file_upload", sdata2)
+        except Exception as e:
+            print(f"upload confirm send error {e}")
+
+    info['task'] = asyncio.create_task(_send_confirm())
+    PENDING_UPLOAD_CONFIRM[uid] = info
+
+def schedule_pdf_rebuild(context, bid, btn):
+    """Multiple files ek burst me aane par PDF ko baar baar rebuild karne ke
+    bajaye, burst khatam hone ke thodi der baad sirf ek baar rebuild karta
+    hai (Render free tier friendly - kam CPU/Telegram/Turso calls)."""
+    prev = PENDING_PDF_REBUILD.get(bid)
+    if prev:
+        try:
+            prev.cancel()
+        except Exception:
+            pass
+
+    async def _rebuild():
+        try:
+            await asyncio.sleep(2.0)
+        except asyncio.CancelledError:
+            return
+        PENDING_PDF_REBUILD.pop(bid, None)
+        try:
+            await refresh_button_pdf_backup(context, bid, btn)
+        except Exception as e:
+            print(f"debounced pdf rebuild error {e}")
+
+    PENDING_PDF_REBUILD[bid] = asyncio.create_task(_rebuild())
+
 PDF_MERGE_TYPES = {"text", "photo", "pdf"}
 PDF_PAGE_W = 595.28
 PDF_PAGE_H = 841.89
@@ -1667,6 +1767,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, f"📤 Send files for {data.split(':')[1]}. Done dabao.", InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="m_done_upload")]]))
 
     elif data == "m_done_upload":
+        cancel_pending_upload_confirm(uid)
         st = await get_user_state(uid)
         upload_ids = st['data'].get('upload_msg_ids', []) if st else []
         for mid in upload_ids: schedule_delete_30(context.bot, q.message.chat_id, mid)
@@ -1880,6 +1981,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         upload_ids = sdata.get('upload_msg_ids', [])
         if text == "✅ Done":
+            cancel_pending_upload_confirm(uid)
             for mid in upload_ids:
                 schedule_delete_30(context.bot, update.effective_chat.id, mid)
             await clear_user_state(uid)
@@ -1938,13 +2040,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (bid, file_info['file_id'], file_info['file_unique_id'], file_info['file_type'], file_info['caption'], backup_chat, backup_mid, datetime.now(timezone.utc).isoformat())
             )
 
-            kb_done = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="m_done_upload")]])
-            confirm = await update.effective_message.reply_text(f"✅ Added {file_info['file_type']} Backup:{'Yes' if backup_mid else 'No'}", reply_markup=kb_done)
-            upload_ids.append(confirm.message_id)
             sdata['upload_msg_ids'] = upload_ids
             await set_user_state(uid, "awaiting_file_upload", sdata)
+            # Debounced: bahut saari files ek sath aane par sirf EK combined
+            # "Done" confirmation jaayega (last me), har file ke baad nahi.
+            schedule_upload_confirm(context, uid, update.effective_chat.id, file_info['file_type'], bool(backup_mid))
             if file_info['file_type'] in PDF_MERGE_TYPES:
-                await refresh_button_pdf_backup(context, bid, btn)
+                schedule_pdf_rebuild(context, bid, btn)
 
         return
 
