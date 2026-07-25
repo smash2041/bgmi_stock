@@ -600,7 +600,7 @@ def schedule_delete_30(bot, chat_id, message_id):
     """Schedule delete after 30 sec - for upload msgs"""
     asyncio.create_task(auto_delete_message(bot, chat_id, message_id, 5))
 
-PDF_MERGE_TYPES = {"text", "photo"}
+PDF_MERGE_TYPES = {"text", "photo", "pdf"}
 PDF_PAGE_W = 595.28
 PDF_PAGE_H = 841.89
 PDF_MARGIN = 42
@@ -742,6 +742,53 @@ def _build_button_pdf_reportlab(button_name, entries, pdf_path):
         c.drawString(PDF_MARGIN, PDF_PAGE_H - PDF_MARGIN - 32, "No text/photo found.")
     c.save()
     return True
+
+def merge_pdf_parts(parts, output_path):
+    """Merge generated pages and uploaded PDF files without loading full files in memory."""
+    if len(parts) == 1:
+        try:
+            import shutil
+            shutil.copyfile(parts[0], output_path)
+            return True
+        except Exception as e:
+            print(f"single pdf copy failed {e}")
+            return False
+    try:
+        from pypdf import PdfWriter
+    except Exception as e:
+        print(f"pypdf missing, uploaded pdf merge skipped: {e}")
+        return False
+    writer = PdfWriter()
+    for part in parts:
+        try:
+            writer.append(part)
+        except Exception as e:
+            print(f"pdf append skipped {part}: {e}")
+    if not writer.pages:
+        return False
+    with open(output_path, "wb") as out:
+        writer.write(out)
+    try:
+        writer.close()
+    except:
+        pass
+    return True
+
+def is_pdf_upload(msg):
+    """Telegram documents that should be merged into the per-button PDF."""
+    doc = getattr(msg, "document", None)
+    if not doc:
+        return False
+    mime = (getattr(doc, "mime_type", "") or "").lower()
+    name = (getattr(doc, "file_name", "") or "").lower()
+    return mime == "application/pdf" or name.endswith(".pdf")
+
+def looks_like_pdf_path(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(5) == b"%PDF-"
+    except:
+        return False
 
 def _jpeg_info(path):
     with open(path, "rb") as f:
@@ -894,7 +941,7 @@ async def refresh_button_pdf_backup(context, bid, btn=None):
         return
     try:
         cur = db.execute(
-            "SELECT id, file_id, file_type, caption FROM button_files WHERE button_id =? AND file_type IN ('text','photo') ORDER BY id",
+            "SELECT id, file_id, file_type, caption FROM button_files WHERE button_id =? AND file_type IN ('text','photo','pdf','document') ORDER BY id",
             (int(bid),)
         )
         rows = cur.fetchall()
@@ -911,6 +958,7 @@ async def refresh_button_pdf_backup(context, bid, btn=None):
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             entries = []
+            pdf_parts = []
             for idx, (_fid, file_id, ftype, caption) in enumerate(rows, start=1):
                 if ftype == "text":
                     entries.append({"type": "text", "text": caption or ""})
@@ -922,11 +970,31 @@ async def refresh_button_pdf_backup(context, bid, btn=None):
                         entries.append({"type": "photo", "path": photo_path, "caption": caption or ""})
                     except Exception as e:
                         entries.append({"type": "text", "text": f"Photo backup could not be downloaded: {e}"})
+                elif ftype in ("pdf", "document") and file_id:
+                    try:
+                        tg_file = await context.bot.get_file(file_id)
+                        tg_path = (getattr(tg_file, "file_path", "") or "").lower()
+                        if ftype != "pdf" and ".pdf" not in tg_path:
+                            continue
+                        source_pdf = os.path.join(tmpdir, f"source_{idx}.pdf")
+                        await tg_file.download_to_drive(custom_path=source_pdf)
+                        if looks_like_pdf_path(source_pdf):
+                            pdf_parts.append(source_pdf)
+                    except Exception as e:
+                        print(f"uploaded pdf download skipped {e}")
+
+            if not entries and not pdf_parts:
+                await delete_button_pdf_backup(context, bid)
+                return
 
             pdf_name = safe_pdf_filename(button_name, bid)
             pdf_path = os.path.join(tmpdir, pdf_name)
-            build_button_pdf(button_name, entries, pdf_path)
-            caption = backup_caption_with_button("Text/photo PDF backup", button_name)
+            generated_pdf = os.path.join(tmpdir, "generated_text_photo.pdf")
+            build_button_pdf(button_name, entries, generated_pdf)
+            parts = [generated_pdf] + pdf_parts
+            if not merge_pdf_parts(parts, pdf_path):
+                build_button_pdf(button_name, entries, pdf_path)
+            caption = backup_caption_with_button("Text/photo/uploaded PDF backup", button_name)
             with open(pdf_path, "rb") as pdf_file:
                 sent = await context.bot.send_document(
                     chat_id=int(BACKUP_CHANNEL_ID),
@@ -1783,7 +1851,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             p = msg.photo[-1]
             file_info = {"file_id": p.file_id, "file_unique_id": p.file_unique_id, "file_type": "photo", "caption": msg.caption or ""}
         elif msg.document:
-            file_info = {"file_id": msg.document.file_id, "file_unique_id": msg.document.file_unique_id, "file_type": "document", "caption": msg.caption or ""}
+            doc_type = "pdf" if is_pdf_upload(msg) else "document"
+            file_info = {"file_id": msg.document.file_id, "file_unique_id": msg.document.file_unique_id, "file_type": doc_type, "caption": msg.caption or ""}
         elif msg.video:
             file_info = {"file_id": msg.video.file_id, "file_unique_id": msg.video.file_unique_id, "file_type": "video", "caption": msg.caption or ""}
         elif msg.audio:
@@ -1811,7 +1880,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         bm = await context.bot.send_audio(int(BACKUP_CHANNEL_ID), audio=file_info['file_id'], caption=backup_caption)
                     elif file_info['file_type'] == 'voice':
                         bm = await context.bot.send_voice(int(BACKUP_CHANNEL_ID), voice=file_info['file_id'], caption=backup_caption)
-                    elif file_info['file_type'] == 'document':
+                    elif file_info['file_type'] in ('document', 'pdf'):
                         bm = await context.bot.send_document(int(BACKUP_CHANNEL_ID), document=file_info['file_id'], caption=backup_caption)
                     else:
                         bm = await context.bot.copy_message(chat_id=int(BACKUP_CHANNEL_ID), from_chat_id=update.effective_chat.id, message_id=msg.message_id)
@@ -1852,9 +1921,59 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(e)
 
+async def rebuildpdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually rebuild PDF backups for existing button data."""
+    uid = update.effective_user.id
+    role = get_user_role(uid)
+    if role == "banned":
+        await update.effective_message.reply_text("ðŸš« You are banned by owner.")
+        return
+    if not BACKUP_CHANNEL_ID:
+        await update.effective_message.reply_text("BACKUP_CHANNEL_ID not set hai.")
+        return
+    args = context.args or []
+    if not args:
+        await update.effective_message.reply_text("Use: /rebuildpdf <button_id>\nOwner: /rebuildpdf all")
+        return
+
+    if args[0].lower() == "all":
+        if not is_owner(uid):
+            await update.effective_message.reply_text("Sirf owner /rebuildpdf all chala sakta hai.")
+            return
+        cur = db.execute("SELECT id, name, visibility, created_by, visible_to_user_id, locked FROM buttons ORDER BY id")
+        rows = cur.fetchall()
+        buttons = [
+            {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4], "locked": r[5]}
+            for r in rows
+        ]
+        status = await update.effective_message.reply_text(f"Rebuild start: {len(buttons)} buttons")
+        done = 0
+        for btn in buttons:
+            await refresh_button_pdf_backup(context, int(btn["id"]), btn)
+            done += 1
+            await asyncio.sleep(0.2)
+        await status.edit_text(f"Rebuild done: {done} buttons checked")
+        return
+
+    try:
+        bid = int(args[0])
+    except:
+        await update.effective_message.reply_text("Button id number me bhejo. Example: /rebuildpdf 12")
+        return
+    btn = get_button_by_id(bid)
+    if not btn:
+        await update.effective_message.reply_text("Button nahi mila.")
+        return
+    if not can_open_manage_button(uid, btn, role):
+        await update.effective_message.reply_text("Is button ke liye permission nahi hai.")
+        return
+    await refresh_button_pdf_backup(context, bid, btn)
+    await update.effective_message.reply_text(f"PDF rebuild checked for: {btn.get('name')}")
+
 # ---------------- TELEGRAM APP SETUP ----------------
 tg_app = Application.builder().token(BOT_TOKEN).build()
 tg_app.add_handler(CommandHandler("start", start_handler))
+tg_app.add_handler(CommandHandler("rebuildpdf", rebuildpdf_handler))
 tg_app.add_handler(CallbackQueryHandler(callback_handler))
 tg_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
 
