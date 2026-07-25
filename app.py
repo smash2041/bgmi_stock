@@ -672,7 +672,7 @@ def schedule_upload_confirm(context, uid, chat_id, file_type, backup_ok):
 
     async def _send_confirm():
         try:
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(3.5)
         except asyncio.CancelledError:
             return
         data = PENDING_UPLOAD_CONFIRM.get(uid)
@@ -712,7 +712,7 @@ def schedule_pdf_rebuild(context, bid, btn):
 
     async def _rebuild():
         try:
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(4.5)
         except asyncio.CancelledError:
             return
         PENDING_PDF_REBUILD.pop(bid, None)
@@ -1415,6 +1415,12 @@ async def send_button_files(update, context, button):
                         await context.bot.send_message(chat_id, f"⚠ Backup copy failed: {e2}")
                 else:
                     await context.bot.send_message(chat_id, "⚠ File expired & no backup found.")
+
+            # Chhota sa pacing gap - Telegram same-chat me bahut fast messages
+            # bhejne par "Too Many Requests / flood control" error deta hai.
+            # Ye delay loop ko thoda dheema kar deta hai taaki 1 button me
+            # bahut saari files hone par bhi flood na ho.
+            await asyncio.sleep(0.35)
 
     except Exception as e:
         await context.bot.send_message(chat_id, f"Error: {e}")
