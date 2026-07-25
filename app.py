@@ -24,6 +24,8 @@ import threading
 import time
 import signal
 import sys
+import tempfile
+import textwrap
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
@@ -232,6 +234,14 @@ def init_db():
         backup_chat_id INTEGER,
         backup_message_id INTEGER,
         created_at TEXT,
+        FOREIGN KEY(button_id) REFERENCES buttons(id) ON DELETE CASCADE
+    )""")
+
+    db.execute("""CREATE TABLE IF NOT EXISTS button_backup_pdfs (
+        button_id INTEGER PRIMARY KEY,
+        backup_chat_id INTEGER,
+        backup_message_id INTEGER,
+        updated_at TEXT,
         FOREIGN KEY(button_id) REFERENCES buttons(id) ON DELETE CASCADE
     )""")
 
@@ -589,6 +599,353 @@ def schedule_delete(bot, chat_id, message_id):
 def schedule_delete_30(bot, chat_id, message_id):
     """Schedule delete after 30 sec - for upload msgs"""
     asyncio.create_task(auto_delete_message(bot, chat_id, message_id, 5))
+
+PDF_MERGE_TYPES = {"text", "photo"}
+PDF_PAGE_W = 595.28
+PDF_PAGE_H = 841.89
+PDF_MARGIN = 42
+
+def safe_pdf_filename(button_name, bid):
+    """Make Telegram-safe PDF filename from button name."""
+    base = clean_button_text(button_name or "").strip() or f"button_{bid}"
+    base = re.sub(r'[\\/:*?"<>|\r\n]+', "_", base)
+    base = re.sub(r"\s+", " ", base).strip(" ._")
+    if not base:
+        base = f"button_{bid}"
+    return f"{base[:70]}.pdf"
+
+def backup_caption_with_button(caption, button_name, limit=1024):
+    """Append button name under backup channel captions without exceeding Telegram limit."""
+    suffix = f"Button: {button_name or 'Unknown'}"
+    base = (caption or "").strip()
+    if base:
+        room = max(0, limit - len(suffix) - 2)
+        if len(base) > room:
+            base = base[:max(0, room - 3)].rstrip() + "..."
+        return f"{base}\n\n{suffix}"
+    return suffix[:limit]
+
+def get_button_pdf_backup(bid):
+    try:
+        cur = db.execute(
+            "SELECT backup_chat_id, backup_message_id FROM button_backup_pdfs WHERE button_id =?",
+            (int(bid),)
+        )
+        return cur.fetchone()
+    except Exception as e:
+        print(f"get pdf backup error {e}")
+        return None
+
+async def delete_button_pdf_backup(context, bid):
+    old = get_button_pdf_backup(bid)
+    if old and old[0] and old[1]:
+        try:
+            await context.bot.delete_message(chat_id=int(old[0]), message_id=int(old[1]))
+        except Exception as e:
+            print(f"old pdf delete skipped {e}")
+    try:
+        db.execute("DELETE FROM button_backup_pdfs WHERE button_id =?", (int(bid),))
+    except Exception as e:
+        print(f"pdf backup row delete error {e}")
+
+def _pdf_text_lines(text, width=82):
+    lines = []
+    for raw in (text or "").replace("\r", "").split("\n"):
+        if not raw:
+            lines.append("")
+            continue
+        wrapped = textwrap.wrap(raw, width=width, replace_whitespace=False, drop_whitespace=False)
+        lines.extend(wrapped or [""])
+    return lines
+
+def _find_pdf_font_path():
+    env_path = os.getenv("PDF_FONT_PATH", "").strip()
+    candidates = [
+        env_path,
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\mangal.ttf",
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+def _build_button_pdf_reportlab(button_name, entries, pdf_path):
+    try:
+        from reportlab.lib.utils import ImageReader
+        from reportlab.pdfgen import canvas
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except Exception:
+        return False
+
+    font_name = "Helvetica"
+    font_path = _find_pdf_font_path()
+    if font_path:
+        try:
+            pdfmetrics.registerFont(TTFont("BackupUnicode", font_path))
+            font_name = "BackupUnicode"
+        except Exception as e:
+            print(f"pdf font register skipped {e}")
+
+    c = canvas.Canvas(pdf_path, pagesize=(PDF_PAGE_W, PDF_PAGE_H))
+    c.setTitle(button_name or "Button Backup")
+    first = True
+
+    def start_page(title):
+        nonlocal first
+        if not first:
+            c.showPage()
+        first = False
+        c.setFont(font_name, 15)
+        c.drawString(PDF_MARGIN, PDF_PAGE_H - PDF_MARGIN, title[:120])
+        c.setFont(font_name, 11)
+
+    for idx, entry in enumerate(entries, start=1):
+        title = f"{idx}. {button_name or 'Button'} - {entry['type']}"
+        if entry["type"] == "text":
+            start_page(title)
+            y = PDF_PAGE_H - PDF_MARGIN - 32
+            for line in _pdf_text_lines(entry.get("text") or ""):
+                if y < PDF_MARGIN:
+                    c.showPage()
+                    c.setFont(font_name, 11)
+                    y = PDF_PAGE_H - PDF_MARGIN
+                c.drawString(PDF_MARGIN, y, line[:180])
+                y -= 15
+        elif entry["type"] == "photo":
+            start_page(title)
+            y = PDF_PAGE_H - PDF_MARGIN - 28
+            caption_lines = _pdf_text_lines(entry.get("caption") or "", width=78)[:8]
+            for line in caption_lines:
+                c.drawString(PDF_MARGIN, y, line[:170])
+                y -= 14
+            if caption_lines:
+                y -= 8
+            try:
+                img = ImageReader(entry["path"])
+                iw, ih = img.getSize()
+                max_w = PDF_PAGE_W - (2 * PDF_MARGIN)
+                max_h = max(120, y - PDF_MARGIN)
+                scale = min(max_w / float(iw), max_h / float(ih))
+                draw_w = iw * scale
+                draw_h = ih * scale
+                x = (PDF_PAGE_W - draw_w) / 2
+                c.drawImage(img, x, PDF_MARGIN, width=draw_w, height=draw_h)
+            except Exception as e:
+                c.drawString(PDF_MARGIN, y, f"Photo could not be rendered: {e}")
+    if first:
+        start_page(button_name or "Button Backup")
+        c.drawString(PDF_MARGIN, PDF_PAGE_H - PDF_MARGIN - 32, "No text/photo found.")
+    c.save()
+    return True
+
+def _jpeg_info(path):
+    with open(path, "rb") as f:
+        data = f.read(2)
+        if data != b"\xff\xd8":
+            raise ValueError("not a jpeg")
+        while True:
+            marker_start = f.read(1)
+            if not marker_start:
+                break
+            if marker_start != b"\xff":
+                continue
+            marker = f.read(1)
+            while marker == b"\xff":
+                marker = f.read(1)
+            code = marker[0]
+            if code in (0xD8, 0xD9):
+                continue
+            length_bytes = f.read(2)
+            if len(length_bytes) != 2:
+                break
+            length = int.from_bytes(length_bytes, "big")
+            if code in (0xC0, 0xC1, 0xC2, 0xC3):
+                chunk = f.read(length - 2)
+                height = int.from_bytes(chunk[1:3], "big")
+                width = int.from_bytes(chunk[3:5], "big")
+                comps = chunk[5]
+                return width, height, comps
+            f.seek(length - 2, os.SEEK_CUR)
+    raise ValueError("jpeg size not found")
+
+def _pdf_stream(data):
+    return b"<< /Length " + str(len(data)).encode("ascii") + b" >>\nstream\n" + data + b"\nendstream"
+
+def _pdf_hex_text(text):
+    raw = ("\ufeff" + (text or "")).encode("utf-16-be", errors="replace")
+    return b"<" + raw.hex().encode("ascii") + b">"
+
+def _manual_pdf_text_ops(lines, x, y, size=11, leading=15):
+    ops = [f"BT /F1 {size} Tf {x:.2f} {y:.2f} Td {leading} TL\n".encode("ascii")]
+    for line in lines:
+        ops.append(_pdf_hex_text(line))
+        ops.append(b" Tj T*\n")
+    ops.append(b"ET\n")
+    return b"".join(ops)
+
+def _build_button_pdf_manual(button_name, entries, pdf_path):
+    objects = {}
+    page_ids = []
+    next_id = 5
+
+    def add_obj(data):
+        nonlocal next_id
+        oid = next_id
+        objects[oid] = data
+        next_id += 1
+        return oid
+
+    def add_page(content, xobject_part=b""):
+        content_id = add_obj(_pdf_stream(content))
+        page_id = add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] "
+            b"/Resources << /Font << /F1 3 0 R >> " + xobject_part + b" >> "
+            b"/Contents " + str(content_id).encode("ascii") + b" 0 R >>"
+        )
+        page_ids.append(page_id)
+
+    if not entries:
+        lines = [button_name or "Button Backup", "", "No text/photo found."]
+        add_page(_manual_pdf_text_ops(lines, PDF_MARGIN, PDF_PAGE_H - PDF_MARGIN, 13, 17))
+
+    for idx, entry in enumerate(entries, start=1):
+        heading = f"{idx}. {button_name or 'Button'} - {entry['type']}"
+        if entry["type"] == "text":
+            lines = [heading, ""] + _pdf_text_lines(entry.get("text") or "", width=78)
+            chunk = []
+            y = PDF_PAGE_H - PDF_MARGIN
+            for line in lines:
+                chunk.append(line)
+                y -= 15
+                if y < PDF_MARGIN:
+                    add_page(_manual_pdf_text_ops(chunk, PDF_MARGIN, PDF_PAGE_H - PDF_MARGIN, 11, 15))
+                    chunk = []
+                    y = PDF_PAGE_H - PDF_MARGIN
+            if chunk:
+                add_page(_manual_pdf_text_ops(chunk, PDF_MARGIN, PDF_PAGE_H - PDF_MARGIN, 11, 15))
+        elif entry["type"] == "photo":
+            try:
+                width, height, comps = _jpeg_info(entry["path"])
+                with open(entry["path"], "rb") as f:
+                    img_bytes = f.read()
+                color = b"/DeviceGray" if comps == 1 else (b"/DeviceCMYK" if comps == 4 else b"/DeviceRGB")
+                image_id = add_obj(
+                    b"<< /Type /XObject /Subtype /Image /Width " + str(width).encode("ascii") +
+                    b" /Height " + str(height).encode("ascii") + b" /ColorSpace " + color +
+                    b" /BitsPerComponent 8 /Filter /DCTDecode /Length " + str(len(img_bytes)).encode("ascii") +
+                    b" >>\nstream\n" + img_bytes + b"\nendstream"
+                )
+                caption_lines = [heading, ""] + _pdf_text_lines(entry.get("caption") or "", width=78)[:8]
+                text_block = _manual_pdf_text_ops(caption_lines, PDF_MARGIN, PDF_PAGE_H - PDF_MARGIN, 11, 15)
+                text_height = max(45, len(caption_lines) * 15 + 18)
+                max_w = PDF_PAGE_W - (2 * PDF_MARGIN)
+                max_h = PDF_PAGE_H - (2 * PDF_MARGIN) - text_height
+                scale = min(max_w / float(width), max_h / float(height))
+                draw_w = width * scale
+                draw_h = height * scale
+                x = (PDF_PAGE_W - draw_w) / 2
+                y = PDF_MARGIN
+                img_ops = f"q {draw_w:.2f} 0 0 {draw_h:.2f} {x:.2f} {y:.2f} cm /Im{idx} Do Q\n".encode("ascii")
+                xobjs = b"/XObject << /Im" + str(idx).encode("ascii") + b" " + str(image_id).encode("ascii") + b" 0 R >>"
+                add_page(text_block + img_ops, xobjs)
+            except Exception as e:
+                lines = [heading, "", f"Photo could not be rendered: {e}"]
+                add_page(_manual_pdf_text_ops(lines, PDF_MARGIN, PDF_PAGE_H - PDF_MARGIN, 11, 15))
+
+    objects[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
+    kids = b" ".join(str(pid).encode("ascii") + b" 0 R" for pid in page_ids)
+    objects[2] = b"<< /Type /Pages /Kids [" + kids + b"] /Count " + str(len(page_ids)).encode("ascii") + b" >>"
+    objects[3] = b"<< /Type /Font /Subtype /Type0 /BaseFont /NotoSans-Regular /Encoding /Identity-H /DescendantFonts [4 0 R] >>"
+    objects[4] = b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /NotoSans-Regular /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /CIDToGIDMap /Identity /DW 1000 >>"
+
+    with open(pdf_path, "wb") as f:
+        f.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        offsets = [0] * (max(objects) + 1)
+        for oid in range(1, max(objects) + 1):
+            offsets[oid] = f.tell()
+            f.write(str(oid).encode("ascii") + b" 0 obj\n")
+            f.write(objects[oid])
+            f.write(b"\nendobj\n")
+        xref = f.tell()
+        f.write(b"xref\n0 " + str(max(objects) + 1).encode("ascii") + b"\n")
+        f.write(b"0000000000 65535 f \n")
+        for oid in range(1, max(objects) + 1):
+            f.write(f"{offsets[oid]:010d} 00000 n \n".encode("ascii"))
+        f.write(b"trailer\n<< /Size " + str(max(objects) + 1).encode("ascii") + b" /Root 1 0 R >>\n")
+        f.write(b"startxref\n" + str(xref).encode("ascii") + b"\n%%EOF\n")
+    return True
+
+def build_button_pdf(button_name, entries, pdf_path):
+    if _build_button_pdf_reportlab(button_name, entries, pdf_path):
+        return True
+    return _build_button_pdf_manual(button_name, entries, pdf_path)
+
+async def refresh_button_pdf_backup(context, bid, btn=None):
+    """Rebuild one button's text/photo PDF in backup channel."""
+    if not BACKUP_CHANNEL_ID:
+        return
+    btn = btn or get_button_by_id(bid)
+    if not btn:
+        return
+    try:
+        cur = db.execute(
+            "SELECT id, file_id, file_type, caption FROM button_files WHERE button_id =? AND file_type IN ('text','photo') ORDER BY id",
+            (int(bid),)
+        )
+        rows = cur.fetchall()
+    except Exception as e:
+        print(f"pdf rows fetch error {e}")
+        return
+
+    if not rows:
+        await delete_button_pdf_backup(context, bid)
+        return
+
+    button_name = btn.get("name") or f"button_{bid}"
+    old = get_button_pdf_backup(bid)
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            entries = []
+            for idx, (_fid, file_id, ftype, caption) in enumerate(rows, start=1):
+                if ftype == "text":
+                    entries.append({"type": "text", "text": caption or ""})
+                elif ftype == "photo" and file_id:
+                    photo_path = os.path.join(tmpdir, f"photo_{idx}.jpg")
+                    try:
+                        tg_file = await context.bot.get_file(file_id)
+                        await tg_file.download_to_drive(custom_path=photo_path)
+                        entries.append({"type": "photo", "path": photo_path, "caption": caption or ""})
+                    except Exception as e:
+                        entries.append({"type": "text", "text": f"Photo backup could not be downloaded: {e}"})
+
+            pdf_name = safe_pdf_filename(button_name, bid)
+            pdf_path = os.path.join(tmpdir, pdf_name)
+            build_button_pdf(button_name, entries, pdf_path)
+            caption = backup_caption_with_button("Text/photo PDF backup", button_name)
+            with open(pdf_path, "rb") as pdf_file:
+                sent = await context.bot.send_document(
+                    chat_id=int(BACKUP_CHANNEL_ID),
+                    document=pdf_file,
+                    filename=pdf_name,
+                    caption=caption
+                )
+
+        db.execute(
+            "INSERT OR REPLACE INTO button_backup_pdfs (button_id, backup_chat_id, backup_message_id, updated_at) VALUES (?,?,?,?)",
+            (int(bid), int(BACKUP_CHANNEL_ID), int(sent.message_id), datetime.now(timezone.utc).isoformat())
+        )
+        if old and old[0] and old[1]:
+            try:
+                await context.bot.delete_message(chat_id=int(old[0]), message_id=int(old[1]))
+            except Exception as e:
+                print(f"old pdf delete skipped {e}")
+    except Exception as e:
+        print(f"pdf rebuild fail {e}")
 
 def build_inline_button(btn):
     """Build inline button from db row"""
@@ -1229,7 +1586,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not can_edit_button(uid, btn, role):
             await safe_edit(q, "Locked or not allowed")
             return
+        cur = db.execute("SELECT file_type FROM button_files WHERE id =?", (int(fid),))
+        deleted_row = cur.fetchone()
         db.execute("DELETE FROM button_files WHERE id =?", (int(fid),))
+        if deleted_row and deleted_row[0] in PDF_MERGE_TYPES:
+            await refresh_button_pdf_backup(context, bid, btn)
         await safe_edit(q, "Deleted", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
 
     elif data.startswith("m_delbtn:"):
@@ -1238,6 +1599,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not can_edit_button(uid, btn, role):
             await safe_edit(q, "Locked or not allowed")
             return
+        await delete_button_pdf_backup(context, bid)
         db.execute("DELETE FROM buttons WHERE id =?", (bid,))
         invalidate_button_cache()
         await safe_edit(q, "✅ Deleted")
@@ -1440,12 +1802,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             backup_mid = None
             if BACKUP_CHANNEL_ID and file_info['file_type']!= 'text':
                 try:
+                    backup_caption = backup_caption_with_button(file_info['caption'], btn.get('name') if btn else "")
                     if file_info['file_type'] == 'photo':
-                        bm = await context.bot.send_photo(int(BACKUP_CHANNEL_ID), photo=file_info['file_id'], caption=file_info['caption'] or f"backup btn {bid}")
+                        bm = await context.bot.send_photo(int(BACKUP_CHANNEL_ID), photo=file_info['file_id'], caption=backup_caption)
                     elif file_info['file_type'] == 'video':
-                        bm = await context.bot.send_video(int(BACKUP_CHANNEL_ID), video=file_info['file_id'], caption=file_info['caption'] or "")
+                        bm = await context.bot.send_video(int(BACKUP_CHANNEL_ID), video=file_info['file_id'], caption=backup_caption)
+                    elif file_info['file_type'] == 'audio':
+                        bm = await context.bot.send_audio(int(BACKUP_CHANNEL_ID), audio=file_info['file_id'], caption=backup_caption)
+                    elif file_info['file_type'] == 'voice':
+                        bm = await context.bot.send_voice(int(BACKUP_CHANNEL_ID), voice=file_info['file_id'], caption=backup_caption)
                     elif file_info['file_type'] == 'document':
-                        bm = await context.bot.send_document(int(BACKUP_CHANNEL_ID), document=file_info['file_id'], caption=file_info['caption'] or "")
+                        bm = await context.bot.send_document(int(BACKUP_CHANNEL_ID), document=file_info['file_id'], caption=backup_caption)
                     else:
                         bm = await context.bot.copy_message(chat_id=int(BACKUP_CHANNEL_ID), from_chat_id=update.effective_chat.id, message_id=msg.message_id)
                     backup_chat = int(BACKUP_CHANNEL_ID)
@@ -1463,6 +1830,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             upload_ids.append(confirm.message_id)
             sdata['upload_msg_ids'] = upload_ids
             set_user_state(uid, "awaiting_file_upload", sdata)
+            if file_info['file_type'] in PDF_MERGE_TYPES:
+                await refresh_button_pdf_backup(context, bid, btn)
 
         return
 
