@@ -94,7 +94,7 @@ class TursoDB:
         self.session = requests.Session()
         # Bigger connection pool so concurrent requests (multiple users clicking
         # at the same time) don't queue up waiting for a free connection.
-        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
         self.headers = {
@@ -178,7 +178,13 @@ class TursoDB:
 # memory/thread usage predictable on a free-tier Render instance while still
 # allowing several users' requests to be in-flight at once.
 import concurrent.futures
-DB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="turso")
+DB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="turso")
+
+# Limits how many PDF rebuilds (download files + build PDF in a temp dir)
+# can run at once. Free-tier RAM is limited, so only 1 rebuild runs at a
+# time instead of possibly several buttons rebuilding in parallel and each
+# holding downloaded photos/PDF bytes in memory simultaneously.
+PDF_BUILD_SEMAPHORE = asyncio.Semaphore(1)
 
 # Initialize Turso DB instance
 db = TursoDB(TURSO_URL, TURSO_TOKEN)
@@ -1069,7 +1075,7 @@ def build_button_pdf(button_name, entries, pdf_path):
         return True
     return _build_button_pdf_manual(button_name, entries, pdf_path)
 
-async def refresh_button_pdf_backup(context, bid, btn=None):
+async def _refresh_button_pdf_backup_impl(context, bid, btn=None):
     """Rebuild one button's text/photo PDF in backup channel."""
     if not BACKUP_CHANNEL_ID:
         return
@@ -1158,6 +1164,17 @@ async def refresh_button_pdf_backup(context, bid, btn=None):
                 print(f"old pdf delete skipped {e}")
     except Exception as e:
         print(f"pdf rebuild fail {e}")
+
+async def refresh_button_pdf_backup(context, bid, btn=None):
+    """
+    Wrapper around the real PDF rebuild logic. Limits how many PDF rebuilds
+    (which download files + build a PDF in a temp dir) can run at the same
+    time using PDF_BUILD_SEMAPHORE, so a free-tier instance with limited RAM
+    never has to hold multiple large PDF builds in memory simultaneously.
+    Actual rebuild logic/behavior is 100% unchanged - just gated.
+    """
+    async with PDF_BUILD_SEMAPHORE:
+        await _refresh_button_pdf_backup_impl(context, bid, btn)
 
 def build_inline_button(btn):
     """Build inline button from db row"""
