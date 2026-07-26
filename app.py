@@ -1,5 +1,5 @@
 # =============================================================================
-# main.py - FINAL 2400+ LINES - TURSO HTTP + BACKUP CHANNEL + NO FORWARD TAG
+# main.py - FINAL 950+ LINES - TURSO HTTP + BACKUP CHANNEL + NO FORWARD TAG
 # + OWNER SUPER POWER + UADMIN PARTITION FIX + SPEED CACHE + SHUTDOWN
 # + MESSAGE NOT MODIFIED FIX + PUBLIC VISIBILITY FIX
 # =============================================================================
@@ -272,6 +272,20 @@ def init_db():
         if "duplicate" not in str(e).lower() and "already exists" not in str(e).lower():
             print(f"visible_to_user_ids column migration skipped: {e}")
 
+    # Owner can now selectively grant a co-owner permission to generate
+    # normal/uadmin access keys, and every key remembers who generated it.
+    try:
+        db.execute("ALTER TABLE co_admins ADD COLUMN can_gen_keys INTEGER DEFAULT 0")
+    except Exception as e:
+        if "duplicate" not in str(e).lower() and "already exists" not in str(e).lower():
+            print(f"can_gen_keys column migration skipped: {e}")
+
+    try:
+        db.execute("ALTER TABLE access_keys ADD COLUMN generated_by INTEGER")
+    except Exception as e:
+        if "duplicate" not in str(e).lower() and "already exists" not in str(e).lower():
+            print(f"generated_by column migration skipped: {e}")
+
     db.execute("""CREATE TABLE IF NOT EXISTS button_files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         button_id INTEGER,
@@ -329,6 +343,7 @@ async def safe_edit(q, text, markup=None):
 CACHE = {
     "co_ids": [],
     "co_ids_set": set(),
+    "co_keygen_set": set(),
     "uadmins": [],
     "uadmin_ids": [],
     "uadmin_ids_set": set(),
@@ -358,9 +373,11 @@ async def refresh_cache(force=False):
     if not force and now - CACHE["ts"] < 45:
         return
     try:
-        cur = await db.aexecute("SELECT user_id FROM co_admins")
-        CACHE["co_ids"] = [int(r[0]) for r in cur.fetchall()]
+        cur = await db.aexecute("SELECT user_id, can_gen_keys FROM co_admins")
+        co_rows = cur.fetchall()
+        CACHE["co_ids"] = [int(r[0]) for r in co_rows]
         CACHE["co_ids_set"] = set(CACHE["co_ids"])
+        CACHE["co_keygen_set"] = {int(r[0]) for r in co_rows if int(r[1] or 0) == 1}
 
         cur = await db.aexecute("SELECT user_id, nickname, created_by, created_at, hidden_from_coowner FROM user_admins ORDER BY created_at DESC")
         CACHE["uadmins"] = [
@@ -433,6 +450,35 @@ async def get_uadmin_hidden_id_set():
         return CACHE.get("uadmin_hidden_set", set())
     except:
         return set()
+
+async def can_generate_keys(uid):
+    """
+    Owner can always generate normal/uadmin keys. A co-owner can ONLY
+    generate keys if the owner has explicitly switched on that permission
+    for them (co_admins.can_gen_keys). Off by default for every co-owner.
+    """
+    if is_owner(uid):
+        return True
+    try:
+        await refresh_cache()
+        return int(uid) in CACHE.get("co_keygen_set", set())
+    except:
+        return False
+
+def get_uadmin_nickname(target_uid):
+    """Sync lookup of a UAdmin's nickname from cache, used to show
+    '(ID:123 - Nickname)' style labels without extra DB calls."""
+    try:
+        target_uid = int(target_uid)
+    except:
+        return ""
+    for ua in CACHE.get("uadmins", []):
+        try:
+            if int(ua.get('user_id')) == target_uid:
+                return ua.get('nickname') or ""
+        except:
+            continue
+    return ""
 
 def invalidate_button_cache():
     """Clear button cache after any button/file/visibility change"""
@@ -1262,8 +1308,11 @@ def format_visibility_mode(btn):
     if vis == "specific_uadmin" and btn:
         ids = get_button_visible_uadmin_ids(btn)
         if ids:
-            ids_str = ",".join(str(i) for i in sorted(ids))
-            return f"{label} (ID:{ids_str})"
+            parts = []
+            for i in sorted(ids):
+                nick = get_uadmin_nickname(i)
+                parts.append(f"{i} ({nick})" if nick else str(i))
+            return f"{label} (ID:{', '.join(parts)})"
     return label
 
 def visible_vis_options_for_role(role):
@@ -1665,6 +1714,9 @@ async def show_admin_panel(update, context):
             [InlineKeyboardButton("👥 User Admins List", callback_data="admin_list_uadmins")],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="main_page:0")]
         ]
+        if await can_generate_keys(uid):
+            kb.insert(0, [InlineKeyboardButton("🔑 Gen Normal Key", callback_data="admin_gen_key"), InlineKeyboardButton("👑 Gen UAdmin Key", callback_data="admin_gen_uadmin_key")])
+            kb.insert(1, [InlineKeyboardButton("📋 List Keys", callback_data="admin_list_keys")])
 
     elif role == "user_admin":
         kb = [
@@ -1807,18 +1859,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("admin_"):
         if data == "admin_gen_key":
-            if not is_owner(uid): return
+            if not await can_generate_keys(uid): return
             k = generate_key()
-            await db.aexecute("INSERT INTO access_keys (key, is_used, key_type, created_at) VALUES (?, 0, 'normal',?)", (k, datetime.now(timezone.utc).isoformat()))
+            await db.aexecute("INSERT INTO access_keys (key, is_used, key_type, created_at, generated_by) VALUES (?, 0, 'normal',?,?)", (k, datetime.now(timezone.utc).isoformat(), int(uid)))
             await safe_edit(q, f"✅ Normal Key:\n`{k}`", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
         elif data == "admin_gen_uadmin_key":
-            if not is_owner(uid): return
+            if not await can_generate_keys(uid): return
             k = generate_uadmin_key()
             await set_user_state(uid, "awaiting_uadmin_nickname", {"key": k})
             await safe_edit(q, f"UAdmin Key: `{k}`\nAb Nickname bhejo")
         elif data == "admin_list_keys":
-            cur = await db.aexecute("SELECT key, is_used, used_by, nickname FROM access_keys ORDER BY created_at DESC LIMIT 20")
-            txt = "🔑 Keys:\n\n" + "\n".join([f"{r[0]} - {'Used' if r[1] else 'Unused'} by {r[2] or '-'} Nick:{r[3] or '-'}" for r in cur.fetchall()])
+            if not await can_generate_keys(uid): return
+            cur = await db.aexecute("SELECT key, is_used, used_by, nickname, generated_by FROM access_keys ORDER BY created_at DESC LIMIT 20")
+            txt = "🔑 Keys:\n\n" + "\n".join([f"{r[0]} - {'Used' if r[1] else 'Unused'} by {r[2] or '-'} | Nick:{r[3] or '-'} | Gen by:{r[4] or OWNER_ID}" for r in cur.fetchall()])
             await safe_edit(q, txt, InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
         elif data == "admin_add_button":
             await set_user_state(uid, "awaiting_new_button_name", {})
@@ -1874,25 +1927,48 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(q, "Not found")
             return
         hide_flag = int(r[2] or 0)
-        hide_label = "👁 Show to Co-Owners" if hide_flag else "🙈 Hide from Co-Owners"
         kb = [
             [InlineKeyboardButton("📂 View Buttons (His Partition)", callback_data=f"uadmin_view_buttons:{tid}")],
             [InlineKeyboardButton("✏ Set Nickname", callback_data=f"uadmin_set_nick:{tid}")],
-            [InlineKeyboardButton("⬆ Promote to Co-Admin", callback_data=f"uadmin_promote:{tid}")],
-            [InlineKeyboardButton(hide_label, callback_data=f"uadmin_hide_toggle:{tid}")],
-            [InlineKeyboardButton("🚫 Ban / Delete", callback_data=f"uadmin_del:{tid}")],
-            [InlineKeyboardButton("Back", callback_data="admin_list_uadmins")]
         ]
-        await safe_edit(q, f"👤 UAdmin: {r[0]}\nID: {tid}\nBy: {r[1]}" + (f"\n🙈 Hidden from Co-Owners" if hide_flag else ""), InlineKeyboardMarkup(kb))
+        extra_line = ""
+        if role == "owner":
+            # Promote / Demote / Ban / Hide-from-co-owner stay OWNER-ONLY
+            # powers - co-owner never sees these controls.
+            hide_label = "👁 Show to Co-Owners" if hide_flag else "🙈 Hide from Co-Owners"
+            kb.append([InlineKeyboardButton("⬆ Promote to Co-Admin", callback_data=f"uadmin_promote:{tid}")])
+            kb.append([InlineKeyboardButton("⬇ Demote to Normal User", callback_data=f"uadmin_demote_user:{tid}")])
+            kb.append([InlineKeyboardButton(hide_label, callback_data=f"uadmin_hide_toggle:{tid}")])
+            kb.append([InlineKeyboardButton("🚫 Ban / Delete", callback_data=f"uadmin_del:{tid}")])
+            extra_line = "\n🙈 Hidden from Co-Owners" if hide_flag else ""
+        kb.append([InlineKeyboardButton("Back", callback_data="admin_list_uadmins")])
+        await safe_edit(q, f"👤 UAdmin: {r[0]}\nID: {tid}\nBy: {r[1]}{extra_line}", InlineKeyboardMarkup(kb))
+
+    elif data.startswith("uadmin_demote_user:"):
+        if not is_owner(uid): return
+        tid = int(data.split(":")[1])
+        await db.aexecute("DELETE FROM user_admins WHERE user_id =?", (tid,))
+        await db.aexecute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)", (tid, datetime.now(timezone.utc).isoformat()))
+        invalidate_access_cache()
+        await refresh_cache(force=True)
+        await safe_edit(q, f"✅ UAdmin {tid} demoted to Normal User (access rakha gaya, admin rights hata di gayi)", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_uadmins")]]))
 
     elif data.startswith("coadmin_view:"):
+        if not is_owner(uid): return
         tid = int(data.split(":")[1])
+        cur = await db.aexecute("SELECT can_gen_keys FROM co_admins WHERE user_id =?", (tid,))
+        r = cur.fetchone()
+        keygen_flag = int(r[0] or 0) if r else 0
+        keygen_label = "🔒 Revoke Key Generation" if keygen_flag else "🔑 Allow Key Generation"
         kb = [
+            [InlineKeyboardButton(keygen_label, callback_data=f"coadmin_keygen_toggle:{tid}")],
             [InlineKeyboardButton("⬇ Demote to UAdmin", callback_data=f"coadmin_demote:{tid}")],
+            [InlineKeyboardButton("⬇⬇ Demote to Normal User", callback_data=f"coadmin_demote_user:{tid}")],
             [InlineKeyboardButton("🚫 Ban / Remove", callback_data=f"coadmin_del:{tid}")],
             [InlineKeyboardButton("Back", callback_data="admin_list_coadmin")]
         ]
-        await safe_edit(q, f"👤 Co-Admin ID: {tid}\nOwner can demote or ban even co-owner", InlineKeyboardMarkup(kb))
+        keygen_txt = "Allowed ✅" if keygen_flag else "Not Allowed ❌"
+        await safe_edit(q, f"👤 Co-Admin ID: {tid}\nKey Generation: {keygen_txt}\nOwner can demote or ban even co-owner", InlineKeyboardMarkup(kb))
 
     elif data.startswith("uadmin_view_buttons:"):
         tid = int(data.split(":")[1])
@@ -1951,6 +2027,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         invalidate_access_cache()
         await refresh_cache(force=True)
         await safe_edit(q, f"✅ Demoted {tid} to UAdmin", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_coadmin")]]))
+
+    elif data.startswith("coadmin_keygen_toggle:"):
+        if not is_owner(uid): return
+        tid = int(data.split(":")[1])
+        cur = await db.aexecute("SELECT can_gen_keys FROM co_admins WHERE user_id =?", (tid,))
+        r = cur.fetchone()
+        cur_flag = int(r[0] or 0) if r else 0
+        new_flag = 0 if cur_flag else 1
+        await db.aexecute("UPDATE co_admins SET can_gen_keys =? WHERE user_id =?", (new_flag, tid))
+        await refresh_cache(force=True)
+        status = "allowed" if new_flag else "revoked"
+        await safe_edit(q, f"✅ Key generation {status} for Co-Admin {tid}", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"coadmin_view:{tid}")]]))
+
+    elif data.startswith("coadmin_demote_user:"):
+        if not is_owner(uid): return
+        tid = int(data.split(":")[1])
+        await db.aexecute("DELETE FROM co_admins WHERE user_id =?", (tid,))
+        await db.aexecute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)", (tid, datetime.now(timezone.utc).isoformat()))
+        invalidate_access_cache()
+        await refresh_cache(force=True)
+        await safe_edit(q, f"✅ Co-Admin {tid} demoted to Normal User (access rakha gaya, co-owner rights hata di gayi)", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_coadmin")]]))
 
     elif data.startswith("coadmin_del:"):
         if not is_owner(uid): return
@@ -2180,7 +2277,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if state == "awaiting_uadmin_nickname":
-        await db.aexecute("INSERT INTO access_keys (key, is_used, nickname, key_type, created_at) VALUES (?, 0,?, 'uadmin',?)", (sdata.get('key'), text, datetime.now(timezone.utc).isoformat()))
+        await db.aexecute("INSERT INTO access_keys (key, is_used, nickname, key_type, created_at, generated_by) VALUES (?, 0,?, 'uadmin',?,?)", (sdata.get('key'), text, datetime.now(timezone.utc).isoformat(), int(uid)))
         await clear_user_state(uid)
         await update.effective_message.reply_text(f"✅ UAdmin Key `{sdata.get('key')}` Nick:{text}", parse_mode="Markdown")
         return
