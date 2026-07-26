@@ -1,5 +1,5 @@
 # =============================================================================
-# main.py - FINAL 950+ LINES - TURSO HTTP + BACKUP CHANNEL + NO FORWARD TAG
+# main.py - FINAL 2400+ LINES - TURSO HTTP + BACKUP CHANNEL + NO FORWARD TAG
 # + OWNER SUPER POWER + UADMIN PARTITION FIX + SPEED CACHE + SHUTDOWN
 # + MESSAGE NOT MODIFIED FIX + PUBLIC VISIBILITY FIX
 # =============================================================================
@@ -253,6 +253,25 @@ def init_db():
         if "duplicate" not in str(e).lower() and "already exists" not in str(e).lower():
             print(f"locked column migration skipped: {e}")
 
+    # Co-owner power upgrade migrations:
+    # 1) hidden_from_coowner on user_admins -> owner can hide a uadmin (and
+    #    their buttons) from every co-owner's view/list.
+    # 2) visible_to_user_ids (TEXT, comma separated) on buttons -> lets
+    #    owner/co-owner pick MULTIPLE uadmins for "specific_uadmin"
+    #    visibility instead of just one. Old visible_to_user_id column is
+    #    kept fully intact for backward compatibility.
+    try:
+        db.execute("ALTER TABLE user_admins ADD COLUMN hidden_from_coowner INTEGER DEFAULT 0")
+    except Exception as e:
+        if "duplicate" not in str(e).lower() and "already exists" not in str(e).lower():
+            print(f"hidden_from_coowner column migration skipped: {e}")
+
+    try:
+        db.execute("ALTER TABLE buttons ADD COLUMN visible_to_user_ids TEXT")
+    except Exception as e:
+        if "duplicate" not in str(e).lower() and "already exists" not in str(e).lower():
+            print(f"visible_to_user_ids column migration skipped: {e}")
+
     db.execute("""CREATE TABLE IF NOT EXISTS button_files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         button_id INTEGER,
@@ -313,6 +332,7 @@ CACHE = {
     "uadmins": [],
     "uadmin_ids": [],
     "uadmin_ids_set": set(),
+    "uadmin_hidden_set": set(),
     "ts": 0
 }
 
@@ -342,13 +362,14 @@ async def refresh_cache(force=False):
         CACHE["co_ids"] = [int(r[0]) for r in cur.fetchall()]
         CACHE["co_ids_set"] = set(CACHE["co_ids"])
 
-        cur = await db.aexecute("SELECT user_id, nickname, created_by, created_at FROM user_admins ORDER BY created_at DESC")
+        cur = await db.aexecute("SELECT user_id, nickname, created_by, created_at, hidden_from_coowner FROM user_admins ORDER BY created_at DESC")
         CACHE["uadmins"] = [
-            {"user_id": r[0], "nickname": r[1], "created_by": r[2], "created_at": r[3]}
+            {"user_id": r[0], "nickname": r[1], "created_by": r[2], "created_at": r[3], "hidden_from_coowner": r[4]}
             for r in cur.fetchall()
         ]
         CACHE["uadmin_ids"] = [int(x['user_id']) for x in CACHE["uadmins"]]
         CACHE["uadmin_ids_set"] = set(CACHE["uadmin_ids"])
+        CACHE["uadmin_hidden_set"] = {int(x['user_id']) for x in CACHE["uadmins"] if int(x.get('hidden_from_coowner') or 0) == 1}
         CACHE["ts"] = now
     except Exception as e:
         print(f"cache refresh error {e}")
@@ -400,6 +421,19 @@ async def get_user_admin_id_set():
     except:
         return set()
 
+async def get_uadmin_hidden_id_set():
+    """
+    UAdmins that the owner has hidden from co-owners.
+    A hidden uadmin's buttons never show in a co-owner's main menu /
+    manage lists, and the uadmin itself is skipped in the co-owner's
+    'User Admins List'.
+    """
+    try:
+        await refresh_cache()
+        return CACHE.get("uadmin_hidden_set", set())
+    except:
+        return set()
+
 def invalidate_button_cache():
     """Clear button cache after any button/file/visibility change"""
     BUTTON_CACHE["buttons"] = []
@@ -435,13 +469,13 @@ async def get_button_by_id(bid):
         if cached and time.time() - BUTTON_CACHE["ts"] < 15:
             return cached
         cur = await db.aexecute(
-            "SELECT id, name, visibility, created_by, visible_to_user_id, locked FROM buttons WHERE id =?",
+            "SELECT id, name, visibility, created_by, visible_to_user_id, locked, visible_to_user_ids FROM buttons WHERE id =?",
             (int(bid),)
         )
         r = cur.fetchone()
         if not r:
             return None
-        return {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4], "locked": r[5]}
+        return {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4], "locked": r[5], "visible_to_user_ids": r[6]}
     except Exception as e:
         print(f"get_button_by_id error {e}")
         return None
@@ -452,9 +486,9 @@ async def get_all_buttons_cached(force=False):
     if not force and now - BUTTON_CACHE["ts"] < 15:
         return BUTTON_CACHE["buttons"]
     try:
-        cur = await db.aexecute("SELECT id, name, visibility, created_by, visible_to_user_id, locked FROM buttons ORDER BY name COLLATE NOCASE")
+        cur = await db.aexecute("SELECT id, name, visibility, created_by, visible_to_user_id, locked, visible_to_user_ids FROM buttons ORDER BY name COLLATE NOCASE")
         BUTTON_CACHE["buttons"] = [
-            {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4], "locked": r[5]}
+            {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4], "locked": r[5], "visible_to_user_ids": r[6]}
             for r in cur.fetchall()
         ]
         BUTTON_CACHE["by_id"] = {int(b["id"]): b for b in BUTTON_CACHE["buttons"]}
@@ -1194,35 +1228,99 @@ VIS_OPTIONS = [
 
 VIS_LABELS = {val: name for name, val in VIS_OPTIONS}
 
+def get_button_visible_uadmin_ids(btn):
+    """
+    Combine the legacy single visible_to_user_id column with the newer
+    comma-separated visible_to_user_ids column, so both old buttons
+    (single UAdmin) and new buttons (multiple UAdmins selected by
+    owner/co-owner) work the same way everywhere.
+    """
+    ids = set()
+    if not btn:
+        return ids
+    single = btn.get('visible_to_user_id')
+    if single:
+        try:
+            ids.add(int(single))
+        except:
+            pass
+    multi = btn.get('visible_to_user_ids')
+    if multi:
+        for part in str(multi).split(','):
+            part = part.strip()
+            if part:
+                try:
+                    ids.add(int(part))
+                except:
+                    pass
+    return ids
+
 def format_visibility_mode(btn):
     """Human readable visibility mode for button detail screens"""
     vis = btn.get('visibility', 'all') if btn else 'all'
     label = VIS_LABELS.get(vis, vis)
-    if vis == "specific_uadmin" and btn and btn.get('visible_to_user_id'):
-        return f"{label} (ID:{btn.get('visible_to_user_id')})"
+    if vis == "specific_uadmin" and btn:
+        ids = get_button_visible_uadmin_ids(btn)
+        if ids:
+            ids_str = ",".join(str(i) for i in sorted(ids))
+            return f"{label} (ID:{ids_str})"
     return label
+
+def visible_vis_options_for_role(role):
+    """
+    Co-owner can set a UAdmin's button to: specific UAdmin(s), all UAdmins,
+    or public/users - but NOT 'Owner Only' (that stays owner's exclusive
+    power, since it would also hide the button from every co-owner).
+    """
+    if role == "co_admin":
+        return [(name, val) for name, val in VIS_OPTIONS if val != "owner_only"]
+    return VIS_OPTIONS
+
+def render_uadmin_multiselect_kb(uadmins, selected_ids, toggle_prefix, confirm_callback, back_callback):
+    """Toggle-style multi-select keyboard so owner/co-owner can pick 1, 2,
+    3... or however many UAdmins should see a 'specific_uadmin' button."""
+    rows = []
+    for ua in uadmins:
+        try:
+            uid_ = int(ua['user_id'])
+        except:
+            continue
+        mark = "✅ " if uid_ in selected_ids else "◻ "
+        rows.append([InlineKeyboardButton(f"{mark}{ua.get('nickname') or 'UAdmin'} (ID:{uid_})", callback_data=f"{toggle_prefix}{uid_}")])
+    rows.append([InlineKeyboardButton(f"✅ Confirm ({len(selected_ids)} selected)", callback_data=confirm_callback)])
+    rows.append([InlineKeyboardButton("Back", callback_data=back_callback)])
+    return InlineKeyboardMarkup(rows)
 
 # ---------------- VISIBILITY LOGIC - FIXED FOR PUBLIC UADMIN BUTTONS ----------------
 
-def can_view_in_main_menu(uid, btn, role, user_admin_ids):
+def can_view_in_main_menu(uid, btn, role, user_admin_ids, uadmin_hidden_ids=None):
     """
     FIXED LOGIC:
     - Public means everyone
     - Owner ke set kiye visibility role ke hisab se button dikhega
+    - Co-Owner (co_admin) ab OWNER jaisa hi almost sab dekh payega -
+      har UAdmin ka button bhi main menu me dikhega, sirf "Owner Only"
+      wale buttons ke alawa. Agar owner ne us button ke UAdmin creator ko
+      hide-from-coowner kar diya hai, to wo button bhi co-owner se chhupa
+      rahega.
     """
+    uadmin_hidden_ids = uadmin_hidden_ids or set()
     vis = btn.get('visibility', 'all')
 
     if role == "owner":
         return True
 
     if role == "co_admin":
-        return vis in ("all", "coowner_owner", "uadmins_coowner")
+        created_by = btn.get('created_by')
+        if created_by and int(created_by) in uadmin_hidden_ids:
+            return False
+        return vis != "owner_only"
 
     if role == "user_admin":
         if vis in ("all", "uadmins_only", "uadmins_coowner"):
             return True
         if vis == "specific_uadmin":
-            return btn.get('visible_to_user_id') and int(btn.get('visible_to_user_id')) == int(uid)
+            return int(uid) in get_button_visible_uadmin_ids(btn)
         return False
 
     if role == "normal_user":
@@ -1230,25 +1328,33 @@ def can_view_in_main_menu(uid, btn, role, user_admin_ids):
 
     return False
 
-def can_access_button(uid, btn, role, user_admin_ids):
+def can_access_button(uid, btn, role, user_admin_ids, uadmin_hidden_ids=None):
     """
     FIXED LOGIC:
-    Owner hamesha data dekh payega, Co-Owner visibility ke hisab se
+    Owner hamesha data dekh payega. Co-Owner ab OWNER jaisa hi power rakhta
+    hai - har UAdmin ke button ka data access kar sakta hai (add files /
+    view), sirf "Owner Only" wale buttons ke alawa, aur sirf tab tak jab tak
+    us UAdmin ko owner ne co-owner se hide nahi kiya hai.
     Privacy ke hisab se normal user dekh payega
     """
+    uadmin_hidden_ids = uadmin_hidden_ids or set()
+
     if role == "owner":
         return True
 
     if role == "co_admin":
         vis = btn.get('visibility', 'all')
-        return vis in ("all", "coowner_owner", "uadmins_coowner")
+        created_by = btn.get('created_by')
+        if created_by and int(created_by) in uadmin_hidden_ids:
+            return False
+        return vis != "owner_only"
 
     if role == "user_admin":
         vis = btn.get('visibility', 'all')
         if vis in ("all", "uadmins_only", "uadmins_coowner"):
             return True
         if vis == "specific_uadmin":
-            return btn.get('visible_to_user_id') and int(btn.get('visible_to_user_id')) == int(uid)
+            return int(uid) in get_button_visible_uadmin_ids(btn)
         return False
 
     if role == "normal_user":
@@ -1259,11 +1365,23 @@ def can_access_button(uid, btn, role, user_admin_ids):
         if vis == "users_owner_only":
             return True
         if str(vis).startswith("specific_uadmin"):
-            return btn.get('visible_to_user_id') and int(btn.get('visible_to_user_id')) == int(uid)
+            return int(uid) in get_button_visible_uadmin_ids(btn)
 
         return False
 
     return False
+
+async def can_access_button_async(uid, btn, role, user_admin_ids=None):
+    """
+    Async convenience wrapper around can_access_button - automatically
+    pulls the co-owner hidden-uadmin set so every call site doesn't need
+    to fetch it manually.
+    """
+    if not btn:
+        return False
+    user_admin_ids = user_admin_ids if user_admin_ids is not None else await get_user_admin_ids()
+    uadmin_hidden_ids = await get_uadmin_hidden_id_set() if role == "co_admin" else set()
+    return can_access_button(uid, btn, role, user_admin_ids, uadmin_hidden_ids)
 
 def can_view_button(uid, btn, role, user_admin_ids):
     """Compatibility wrapper"""
@@ -1275,7 +1393,8 @@ async def get_buttons_paginated_for_user(uid, page, role=None):
 
     role = role or await get_user_role(uid)
     user_admin_ids = await get_user_admin_ids()
-    filtered = [b for b in all_btns if can_view_in_main_menu(uid, b, role, user_admin_ids)]
+    uadmin_hidden_ids = await get_uadmin_hidden_id_set() if role == "co_admin" else set()
+    filtered = [b for b in all_btns if can_view_in_main_menu(uid, b, role, user_admin_ids, uadmin_hidden_ids)]
     total = len(filtered)
     start = page * PER_PAGE
     return filtered[start:start + PER_PAGE], total
@@ -1307,26 +1426,39 @@ async def can_open_manage_button(uid, btn, role):
         return True
     if role == "co_admin":
         if created_by and int(created_by) in await get_user_admin_id_set():
-            return can_access_button(uid, btn, role, await get_user_admin_ids())
+            return await can_access_button_async(uid, btn, role)
         return True
     if role == "user_admin":
         return created_by and int(created_by) == int(uid)
     return False
 
 async def can_add_files_to_button(uid, btn, role):
-    """Co-owner can add files to owner buttons, but locked buttons cannot be edited"""
+    """
+    Co-owner can add files to owner buttons AND to any (non-hidden) UAdmin's
+    button too - co-owner is more powerful than a UAdmin now. Locked
+    buttons still cannot be touched by anyone except owner unlock.
+    """
     if not await can_open_manage_button(uid, btn, role) or is_locked_button(btn):
         return False
     if role == "owner":
         return True
     if role == "co_admin":
-        return not (btn.get('created_by') and int(btn.get('created_by')) in await get_user_admin_id_set())
+        # can_open_manage_button already blocked owner_only / hidden-uadmin
+        # buttons above, so anything that reaches here is fair game to add
+        # files to (owner's own buttons, other buttons, and UAdmin buttons).
+        return True
     if role == "user_admin":
         return btn.get('created_by') and int(btn.get('created_by')) == int(uid)
     return False
 
 async def can_edit_button(uid, btn, role):
-    """Delete/edit permissions for button settings and files"""
+    """
+    Delete/edit permissions for button settings and files. Co-owner is
+    intentionally NOT allowed to delete a button or wipe its files/data if
+    it belongs to the owner or to a UAdmin - co-owner can only add files
+    and view data there. Co-owner can still fully manage buttons they
+    created themselves.
+    """
     if not await can_open_manage_button(uid, btn, role) or is_locked_button(btn):
         return False
     if role == "owner":
@@ -1338,10 +1470,28 @@ async def can_edit_button(uid, btn, role):
     return False
 
 async def can_change_visibility(uid, btn, role):
-    """Only owner/co-owner can change visibility, never UAdmin"""
-    if role == "user_admin":
+    """
+    Only owner/co-owner can change visibility, never UAdmin.
+    Co-owner gets an extra power here (on top of can_edit_button): it can
+    change the visibility of any (non-hidden) UAdmin-created button - to
+    specific UAdmin(s), all UAdmins, or public/users - even though it can't
+    delete that button or its files. Co-owner still cannot re-touch
+    visibility of the owner's own buttons unless it created them itself
+    (same as can_edit_button).
+    """
+    if not btn or role == "user_admin":
         return False
-    return await can_edit_button(uid, btn, role)
+    if not await can_open_manage_button(uid, btn, role) or is_locked_button(btn):
+        return False
+    if role == "owner":
+        return True
+    if role == "co_admin":
+        created_by = btn.get('created_by')
+        if created_by and int(created_by) in await get_user_admin_id_set():
+            hidden_ids = await get_uadmin_hidden_id_set()
+            return int(created_by) not in hidden_ids
+        return await can_edit_button(uid, btn, role)
+    return False
 
 async def show_manage_button_menu(update, context, bid, role=None, back_callback="admin_manage_list"):
     """Show button management actions from admin panel or direct main-menu click"""
@@ -1380,7 +1530,7 @@ async def send_button_files(update, context, button):
     uid = update.effective_user.id
     role = await get_user_role(uid)
 
-    if not can_access_button(uid, button, role, await get_user_admin_ids()):
+    if not await can_access_button_async(uid, button, role):
         m = await context.bot.send_message(chat_id, "❌ You can't view this button")
         schedule_delete(context.bot, chat_id, m.message_id)
         return
@@ -1562,7 +1712,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         btn = await get_button_by_id(bid)
         if not btn:
             return
-        if not can_access_button(uid, btn, role, await get_user_admin_ids()):
+        if not await can_access_button_async(uid, btn, role):
             return
         if role in ("owner", "co_admin", "user_admin") and await can_open_manage_button(uid, btn, role):
             await show_manage_button_menu(update, context, int(bid), role, "main_page:0")
@@ -1574,7 +1724,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         btn = await get_button_by_id(bid)
         if not btn:
             return
-        if not can_access_button(uid, btn, role, await get_user_admin_ids()):
+        if not await can_access_button_async(uid, btn, role):
             return
         await send_button_files(update, context, btn)
 
@@ -1593,9 +1743,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             vis = "all"
         if vis == "specific_uadmin":
             uadmins = await get_all_user_admins()
-            rows = [[InlineKeyboardButton(f"{ua['nickname']} (ID:{ua['user_id']})", callback_data=f"vis_specific_select:{ua['user_id']}")] for ua in uadmins]
-            rows.append([InlineKeyboardButton("Back", callback_data="admin_panel")])
-            await safe_edit(q, "👤 Select UAdmin:", InlineKeyboardMarkup(rows))
+            await set_user_state(uid, "awaiting_new_button_vis_multi", {"name": st['data']['name'], "selected": []})
+            rows = render_uadmin_multiselect_kb(uadmins, set(), "vis_multi_toggle:", "vis_multi_confirm", "admin_panel")
+            await safe_edit(q, "👤 Select UAdmin(s) - tap to toggle, then Confirm:", rows)
             return
         try:
             await db.aexecute("INSERT INTO buttons (name, visibility, btn_type, created_by) VALUES (?,?, 'callback',?)", (st['data']['name'], vis, int(uid)))
@@ -1614,6 +1764,44 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.aexecute("INSERT INTO buttons (name, visibility, btn_type, created_by, visible_to_user_id) VALUES (?, 'specific_uadmin', 'callback',?,?)", (st['data']['name'], int(uid), target_id))
         invalidate_button_cache()
         await safe_edit(q, f"✅ Created for UAdmin {target_id}")
+        await clear_user_state(uid)
+        await show_main_menu(update, context, 0)
+
+    elif data.startswith("vis_multi_toggle:"):
+        target_id = int(data.split(":")[1])
+        st = await get_user_state(uid)
+        if not st or st['state']!= "awaiting_new_button_vis_multi":
+            return
+        selected = set(st['data'].get('selected', []))
+        if target_id in selected:
+            selected.discard(target_id)
+        else:
+            selected.add(target_id)
+        st['data']['selected'] = list(selected)
+        await set_user_state(uid, "awaiting_new_button_vis_multi", st['data'])
+        uadmins = await get_all_user_admins()
+        rows = render_uadmin_multiselect_kb(uadmins, selected, "vis_multi_toggle:", "vis_multi_confirm", "admin_panel")
+        await safe_edit(q, "👤 Select UAdmin(s) - tap to toggle, then Confirm:", rows)
+
+    elif data == "vis_multi_confirm":
+        st = await get_user_state(uid)
+        if not st or st['state']!= "awaiting_new_button_vis_multi":
+            return
+        selected = st['data'].get('selected', [])
+        if not selected:
+            await safe_edit(q, "⚠ Kam se kam 1 UAdmin select karo")
+            return
+        ids_csv = ",".join(str(x) for x in selected)
+        first_id = selected[0]
+        try:
+            await db.aexecute(
+                "INSERT INTO buttons (name, visibility, btn_type, created_by, visible_to_user_id, visible_to_user_ids) VALUES (?, 'specific_uadmin', 'callback',?,?,?)",
+                (st['data']['name'], int(uid), int(first_id), ids_csv)
+            )
+            invalidate_button_cache()
+            await safe_edit(q, f"✅ Created for {len(selected)} UAdmin(s)")
+        except Exception as e:
+            await safe_edit(q, f"❌ Exists: {e}")
         await clear_user_state(uid)
         await show_main_menu(update, context, 0)
 
@@ -1661,6 +1849,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(q, "📜 Co-Admins - click to manage:", InlineKeyboardMarkup(kb))
         elif data == "admin_list_uadmins":
             uadmins = await get_all_user_admins()
+            if role == "co_admin":
+                hidden_ids = await get_uadmin_hidden_id_set()
+                uadmins = [ua for ua in uadmins if int(ua['user_id']) not in hidden_ids]
             if not uadmins:
                 await safe_edit(q, "No User Admins", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
                 return
@@ -1672,19 +1863,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("uadmin_view:"):
         tid = int(data.split(":")[1])
-        cur = await db.aexecute("SELECT nickname, created_by FROM user_admins WHERE user_id =?", (tid,))
+        if role == "co_admin":
+            hidden_ids = await get_uadmin_hidden_id_set()
+            if tid in hidden_ids:
+                await safe_edit(q, "Not found")
+                return
+        cur = await db.aexecute("SELECT nickname, created_by, hidden_from_coowner FROM user_admins WHERE user_id =?", (tid,))
         r = cur.fetchone()
         if not r:
             await safe_edit(q, "Not found")
             return
+        hide_flag = int(r[2] or 0)
+        hide_label = "👁 Show to Co-Owners" if hide_flag else "🙈 Hide from Co-Owners"
         kb = [
             [InlineKeyboardButton("📂 View Buttons (His Partition)", callback_data=f"uadmin_view_buttons:{tid}")],
             [InlineKeyboardButton("✏ Set Nickname", callback_data=f"uadmin_set_nick:{tid}")],
             [InlineKeyboardButton("⬆ Promote to Co-Admin", callback_data=f"uadmin_promote:{tid}")],
+            [InlineKeyboardButton(hide_label, callback_data=f"uadmin_hide_toggle:{tid}")],
             [InlineKeyboardButton("🚫 Ban / Delete", callback_data=f"uadmin_del:{tid}")],
             [InlineKeyboardButton("Back", callback_data="admin_list_uadmins")]
         ]
-        await safe_edit(q, f"👤 UAdmin: {r[0]}\nID: {tid}\nBy: {r[1]}", InlineKeyboardMarkup(kb))
+        await safe_edit(q, f"👤 UAdmin: {r[0]}\nID: {tid}\nBy: {r[1]}" + (f"\n🙈 Hidden from Co-Owners" if hide_flag else ""), InlineKeyboardMarkup(kb))
 
     elif data.startswith("coadmin_view:"):
         tid = int(data.split(":")[1])
@@ -1697,6 +1896,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("uadmin_view_buttons:"):
         tid = int(data.split(":")[1])
+        if role == "co_admin":
+            hidden_ids = await get_uadmin_hidden_id_set()
+            if tid in hidden_ids:
+                await safe_edit(q, "Not found")
+                return
         cur = await db.aexecute("SELECT id, name, visibility, locked FROM buttons WHERE created_by =?", (tid,))
         rows = cur.fetchall()
         if not rows:
@@ -1725,6 +1929,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         invalidate_access_cache()
         await refresh_cache(force=True)
         await safe_edit(q, f"✅ Promoted {tid} to Co-Admin", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_uadmins")]]))
+
+    elif data.startswith("uadmin_hide_toggle:"):
+        if not is_owner(uid): return
+        tid = int(data.split(":")[1])
+        cur = await db.aexecute("SELECT hidden_from_coowner FROM user_admins WHERE user_id =?", (tid,))
+        r = cur.fetchone()
+        cur_flag = int(r[0] or 0) if r else 0
+        new_flag = 0 if cur_flag else 1
+        await db.aexecute("UPDATE user_admins SET hidden_from_coowner =? WHERE user_id =?", (new_flag, tid))
+        await refresh_cache(force=True)
+        status = "hidden from" if new_flag else "visible to"
+        await safe_edit(q, f"✅ UAdmin {tid} is now {status} Co-Owners", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"uadmin_view:{tid}")]]))
 
     elif data.startswith("coadmin_demote:"):
         if not is_owner(uid): return
@@ -1849,7 +2065,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await can_change_visibility(uid, btn, role):
             await safe_edit(q, "Locked or not allowed")
             return
-        rows = [[InlineKeyboardButton(name, callback_data=f"m_vis_set:{bid}:{val}")] for name, val in VIS_OPTIONS]
+        rows = [[InlineKeyboardButton(name, callback_data=f"m_vis_set:{bid}:{val}")] for name, val in visible_vis_options_for_role(role)]
         rows.append([InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")])
         await safe_edit(q, f"Current Visibility: {format_visibility_mode(btn)}\nVisibility for {bid}: (Public = All)", InlineKeyboardMarkup(rows))
 
@@ -1863,11 +2079,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if vis == "specific_uadmin":
             uadmins = await get_all_user_admins()
-            rows = [[InlineKeyboardButton(f"{ua['nickname']} (ID:{ua['user_id']})", callback_data=f"m_vis_specific:{bid}:{ua['user_id']}")] for ua in uadmins]
-            rows.append([InlineKeyboardButton("Back", callback_data=f"m_vis:{bid}")])
-            await safe_edit(q, "Select UAdmin:", InlineKeyboardMarkup(rows))
+            await set_user_state(uid, "awaiting_edit_vis_multi", {"button_id": bid, "selected": []})
+            rows = render_uadmin_multiselect_kb(uadmins, set(), f"m_vis_multi_toggle:{bid}:", f"m_vis_multi_confirm:{bid}", f"m_vis:{bid}")
+            await safe_edit(q, "Select UAdmin(s) - tap to toggle, then Confirm:", rows)
             return
-        await db.aexecute("UPDATE buttons SET visibility =?, visible_to_user_id = NULL WHERE id =?", (vis, bid))
+        await db.aexecute("UPDATE buttons SET visibility =?, visible_to_user_id = NULL, visible_to_user_ids = NULL WHERE id =?", (vis, bid))
         invalidate_button_cache()
         await safe_edit(q, f"Vis -> {vis} (All = public)", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
 
@@ -1880,6 +2096,48 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.aexecute("UPDATE buttons SET visibility = 'specific_uadmin', visible_to_user_id =? WHERE id =?", (int(target_id), int(bid)))
         invalidate_button_cache()
         await safe_edit(q, f"Vis -> Specific UAdmin {target_id}", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
+
+    elif data.startswith("m_vis_multi_toggle:"):
+        _, bid, target_id = data.split(":")
+        bid = int(bid); target_id = int(target_id)
+        btn = await get_button_by_id(bid)
+        if not await can_change_visibility(uid, btn, role):
+            await safe_edit(q, "Locked or not allowed")
+            return
+        st = await get_user_state(uid)
+        if not st or st['state']!= "awaiting_edit_vis_multi":
+            return
+        selected = set(st['data'].get('selected', []))
+        if target_id in selected:
+            selected.discard(target_id)
+        else:
+            selected.add(target_id)
+        st['data']['selected'] = list(selected)
+        await set_user_state(uid, "awaiting_edit_vis_multi", st['data'])
+        uadmins = await get_all_user_admins()
+        rows = render_uadmin_multiselect_kb(uadmins, selected, f"m_vis_multi_toggle:{bid}:", f"m_vis_multi_confirm:{bid}", f"m_vis:{bid}")
+        await safe_edit(q, "Select UAdmin(s) - tap to toggle, then Confirm:", rows)
+
+    elif data.startswith("m_vis_multi_confirm:"):
+        bid = int(data.split(":")[1])
+        btn = await get_button_by_id(bid)
+        if not await can_change_visibility(uid, btn, role):
+            await safe_edit(q, "Locked or not allowed")
+            return
+        st = await get_user_state(uid)
+        selected = st['data'].get('selected', []) if st else []
+        if not selected:
+            await safe_edit(q, "⚠ Kam se kam 1 UAdmin select karo")
+            return
+        ids_csv = ",".join(str(x) for x in selected)
+        first_id = selected[0]
+        await db.aexecute(
+            "UPDATE buttons SET visibility = 'specific_uadmin', visible_to_user_id =?, visible_to_user_ids =? WHERE id =?",
+            (int(first_id), ids_csv, bid)
+        )
+        invalidate_button_cache()
+        await clear_user_state(uid)
+        await safe_edit(q, f"Vis -> Specific UAdmin(s): {len(selected)} selected", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
 
 # ---------------- MESSAGE HANDLER ----------------
 
@@ -1951,7 +2209,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         else:
             await set_user_state(uid, "awaiting_new_button_vis", {"name": text})
-            rows = [[InlineKeyboardButton(name, callback_data=f"vis_{val}")] for name, val in VIS_OPTIONS]
+            rows = [[InlineKeyboardButton(name, callback_data=f"vis_{val}")] for name, val in visible_vis_options_for_role(role)]
             await update.effective_message.reply_text("👁 Visibility choose karo:", reply_markup=InlineKeyboardMarkup(rows))
             return
 
@@ -2080,7 +2338,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clean_text_lower = clean_button_text(text).lower()
             matched = BUTTON_CACHE.get("name_map", {}).get(text_lower) or BUTTON_CACHE.get("name_map", {}).get(clean_text_lower)
             role = await get_user_role(uid)
-            if matched and can_access_button(uid, matched, role, await get_user_admin_ids()):
+            if matched and await can_access_button_async(uid, matched, role):
                 await send_button_files(update, context, matched)
         except Exception as e:
             print(e)
@@ -2104,10 +2362,10 @@ async def rebuildpdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not is_owner(uid):
             await update.effective_message.reply_text("Sirf owner /rebuildpdf all chala sakta hai.")
             return
-        cur = await db.aexecute("SELECT id, name, visibility, created_by, visible_to_user_id, locked FROM buttons ORDER BY id")
+        cur = await db.aexecute("SELECT id, name, visibility, created_by, visible_to_user_id, locked, visible_to_user_ids FROM buttons ORDER BY id")
         rows = cur.fetchall()
         buttons = [
-            {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4], "locked": r[5]}
+            {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4], "locked": r[5], "visible_to_user_ids": r[6]}
             for r in rows
         ]
         status = await update.effective_message.reply_text(f"Rebuild start: {len(buttons)} buttons")
