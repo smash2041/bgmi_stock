@@ -1532,6 +1532,7 @@ async def show_admin_panel(update, context):
             [InlineKeyboardButton("👥 User Admins List", callback_data="admin_list_uadmins")],
             [InlineKeyboardButton(await dark_mode_controller.owner_panel_label(), callback_data="dm:panel"), InlineKeyboardButton("Dark Mode Commands", callback_data="dm:perms")],
             [InlineKeyboardButton("🚫 Ban User", callback_data="owner_ban"), InlineKeyboardButton("✅ Unban User", callback_data="owner_unban")],
+            [InlineKeyboardButton("🔄 Rebuild PDF (Single)", callback_data="rebuild_single_prompt"), InlineKeyboardButton("🔄 Rebuild All PDFs", callback_data="rebuild_all_pdfs")],
             [InlineKeyboardButton("📜 Banned List", callback_data="owner_banned_list"), InlineKeyboardButton("♻ Shutdown / Restart", callback_data="owner_shutdown")],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="main_page:0")]
         ]
@@ -1911,6 +1912,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             loop = asyncio.get_running_loop()
             loop.create_task(_graceful_shutdown_sequence())
 
+        elif data == "rebuild_all_pdfs":
+            if not is_owner(uid): return
+            if not BACKUP_CHANNEL_ID:
+                await safe_edit(q, "❌ BACKUP_CHANNEL_ID not set hai.", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
+                return
+            cur = await db.aexecute("SELECT id, name, visibility, created_by, visible_to_user_id, locked, visible_to_user_ids FROM buttons ORDER BY id")
+            rows = cur.fetchall()
+            buttons = [
+                {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4], "locked": r[5], "visible_to_user_ids": r[6]}
+                for r in rows
+            ]
+            await safe_edit(q, f"🔄 Rebuild start: {len(buttons)} buttons...")
+            done = 0
+            for btn in buttons:
+                await refresh_button_pdf_backup(context, int(btn["id"]), btn)
+                done += 1
+                await asyncio.sleep(0.2)
+            await q.message.edit_text(f"✅ Rebuild done: {done} buttons checked", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
+
+        elif data == "rebuild_single_prompt":
+            if not is_owner(uid): return
+            if not BACKUP_CHANNEL_ID:
+                await safe_edit(q, "❌ BACKUP_CHANNEL_ID not set hai.", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
+                return
+            await set_user_state(uid, "awaiting_rebuild_bid", {})
+            await safe_edit(q, "🔄 Button ID bhejo jiska PDF rebuild karna hai:", InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]]))
+
+
         elif data.startswith("manage_btn:"):
             bid = int(data.split(":")[1])
             await show_manage_button_menu(update, context, bid, role, "admin_manage_list")
@@ -2219,6 +2248,25 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(f"✅ Unbanned {tid}")
         except Exception as e:
             await update.effective_message.reply_text(f"Error: {e}")
+        await clear_user_state(uid)
+        return
+
+    if state == "awaiting_rebuild_bid":
+        if not is_owner(uid):
+            await clear_user_state(uid)
+            return
+        try:
+            bid = int(re.search(r'\d+', text).group())
+        except Exception:
+            await update.effective_message.reply_text("❌ Button ID number mein bhejo. Example: 12")
+            return
+        btn = await get_button_by_id(bid)
+        if not btn:
+            await update.effective_message.reply_text("❌ Button nahi mila.")
+            await clear_user_state(uid)
+            return
+        await refresh_button_pdf_backup(context, bid, btn)
+        await update.effective_message.reply_text(f"✅ PDF rebuild checked for: {btn.get('name')}")
         await clear_user_state(uid)
         return
 
