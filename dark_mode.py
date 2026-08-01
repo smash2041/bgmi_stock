@@ -234,21 +234,27 @@ class DarkMode:
                 logging.warning("Dark Mode Telethon not started: TELETHON_SESSION string or existing TELETHON_SESSION_FILE is required.")
                 return False
 
-        self.client = TelegramClient(session_obj, api_id, api_hash)
-        await self.client.start()
-        self.client.add_event_handler(
-            self._on_botb_new_message,
-            events.NewMessage(chats=self.private_group_id, from_users=self.bot_b_id),
-        )
-        self.client.add_event_handler(
-            self._on_botb_message_edited,
-            events.MessageEdited(chats=self.private_group_id, from_users=self.bot_b_id),
-        )
-        self.worker_task = asyncio.create_task(self._queue_worker())
-        self.cleanup_task = asyncio.create_task(self._cleanup_loop())
-        self.started = True
-        logging.info("Dark Mode Telethon started.")
-        return True
+        try:
+            self.client = TelegramClient(session_obj, api_id, api_hash)
+            await self.client.start()
+            self.client.add_event_handler(
+                self._on_botb_new_message,
+                events.NewMessage(chats=self.private_group_id, from_users=self.bot_b_id),
+            )
+            self.client.add_event_handler(
+                self._on_botb_message_edited,
+                events.MessageEdited(chats=self.private_group_id, from_users=self.bot_b_id),
+            )
+            self.worker_task = asyncio.create_task(self._queue_worker())
+            self.cleanup_task = asyncio.create_task(self._cleanup_loop())
+            self.started = True
+            logging.info("Dark Mode Telethon started.")
+            return True
+        except Exception as e:
+            logging.error(f"Dark Mode Telethon start failed: {e}")
+            self.client = None
+            self.started = False
+            return False
 
     async def stop(self):
         if getattr(self, "worker_task", None):
@@ -290,7 +296,11 @@ class DarkMode:
             enabled = not await self.is_enabled()
             await self.set_enabled(enabled)
             if enabled:
-                await self.start(context.bot)
+                started = await self.start(context.bot)
+                if not started:
+                    note = "Dark Mode ON ✅ — ⚠️ Lekin Telethon bridge start nahi hua (env config missing). Dark mode commands kaam nahi karenge jab tak env set na ho."
+                    await self._show_panel(q, note=note)
+                    return
             await self._show_panel(q, note=f"Dark Mode {'ON' if enabled else 'OFF'}")
         elif data == "dm:perms":
             await self.clear_user_state(uid)
@@ -332,7 +342,7 @@ class DarkMode:
             if not await self._validate_preview_owner(q, request_id):
                 return True
             await self.set_user_state(uid, STATE_NEW_BUTTON_NAME, {"request_id": request_id})
-            await self._screen(q, "✍️ Send new button name.")
+            await self._screen(q, "✍️ Send new folder name.")
         else:
             await self._screen(q, "❓ Unknown Dark Mode action.")
         return True
@@ -380,16 +390,16 @@ class DarkMode:
                 await update.effective_message.reply_text("Preview expired. Command dobara run karo.")
                 return True
             if not text:
-                await update.effective_message.reply_text("Valid button name bhejo.")
+                await update.effective_message.reply_text("Valid folder name bhejo.")
                 return True
             duplicate = await self._find_case_duplicate(text)
             if duplicate:
-                await update.effective_message.reply_text(f"Duplicate button exists: {duplicate.get('name')}")
+                await update.effective_message.reply_text(f"Duplicate folder exists: {duplicate.get('name')}")
                 return True
             bid = await self._create_button_for_user(uid, text)
             await self.clear_user_state(uid)
             if not bid:
-                await update.effective_message.reply_text("Button create nahi ho paya.")
+                await update.effective_message.reply_text("Folder create nahi ho paya.")
                 return True
             fake_q = _MessageScreen(update.effective_message)
             await self._save_preview_to_button(fake_q, context, request_id, int(bid))
@@ -523,7 +533,18 @@ class DarkMode:
         if not reply_to and getattr(msg, "reply_to", None):
             reply_to = getattr(msg.reply_to, "reply_to_msg_id", None)
         if reply_to:
-            return self.telethon_msg_to_request.get(int(reply_to))
+            req_id = self.telethon_msg_to_request.get(int(reply_to))
+            if req_id:
+                return req_id
+            req_id = self.botb_msg_to_request.get(int(reply_to))
+            if req_id:
+                return req_id
+                
+        if not reply_to:
+            pending = [req for req in self.requests.values() if req.status not in ("delivered", "expired")]
+            if len(pending) == 1:
+                return pending[0].request_id
+                
         return None
 
     async def _consider_final(self, req_id: str, msg, *, edited: bool):
@@ -587,8 +608,8 @@ class DarkMode:
         if self.bot is None:
             return
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add to existing button", callback_data=f"dm:add:{req_id}")],
-            [InlineKeyboardButton("🆕 Create new button", callback_data=f"dm:new:{req_id}")],
+            [InlineKeyboardButton("➕ Add to existing folder", callback_data=f"dm:add:{req_id}")],
+            [InlineKeyboardButton("🆕 Create new folder", callback_data=f"dm:new:{req_id}")],
         ])
         text = (getattr(msg, "raw_text", None) or getattr(msg, "message", None) or "").strip()
         sent = None
@@ -597,12 +618,19 @@ class DarkMode:
             if getattr(msg, "media", None):
                 tmpdir = tempfile.mkdtemp(prefix="dark_mode_")
                 path = await msg.download_media(file=tmpdir)
-                caption = text[:1024] if text else None
-                with open(path, "rb") as fh:
-                    sent = await self.bot.send_document(
+                if path:
+                    caption = text[:1024] if text else None
+                    with open(path, "rb") as fh:
+                        sent = await self.bot.send_document(
+                            chat_id=req.chat_id,
+                            document=fh,
+                            caption=caption,
+                            reply_markup=markup,
+                        )
+                else:
+                    sent = await self.bot.send_message(
                         chat_id=req.chat_id,
-                        document=fh,
-                        caption=caption,
+                        text=text or "Media could not be downloaded.",
                         reply_markup=markup,
                     )
             else:
@@ -611,9 +639,29 @@ class DarkMode:
                     text=text or "Final result empty hai.",
                     reply_markup=markup,
                 )
+        except Exception as e:
+            logging.error(f"Dark mode deliver_final error: {e}")
+            try:
+                err_msg = await self.bot.send_message(req.chat_id, f"⚠️ Error sending result: {e}")
+                async def _delete_err():
+                    await asyncio.sleep(self.preview_seconds)
+                    try:
+                        await self.bot.delete_message(req.chat_id, err_msg.message_id)
+                    except Exception:
+                        pass
+                asyncio.create_task(_delete_err())
+            except Exception:
+                pass
+            finally:
+                self._cleanup_request_tracking(req_id)
+            return
         finally:
             if tmpdir:
                 shutil.rmtree(tmpdir, ignore_errors=True)
+
+        if not sent:
+            self._cleanup_request_tracking(req_id)
+            return
 
         file_info = self._extract_file_info(sent)
         self.previews[req_id] = PreviewPayload(
@@ -696,12 +744,38 @@ class DarkMode:
         enabled = await self.is_enabled()
         status_badge = "🟢 <b>ACTIVE</b>" if enabled else "🔴 <b>PAUSED</b>"
         bridge_badge = "🟢 READY" if self.started else "🟡 STANDBY"
+
+        # Check for missing env config and build warning text
+        missing_vars = []
+        if TelegramClient is None:
+            missing_vars.append("telethon package (not installed)")
+        else:
+            if not self._env_int("TELETHON_API_ID"):
+                missing_vars.append("TELETHON_API_ID")
+            if not os.getenv("TELETHON_API_HASH", "").strip():
+                missing_vars.append("TELETHON_API_HASH")
+            session_value = os.getenv("TELETHON_SESSION", "").strip()
+            session_file = os.getenv("TELETHON_SESSION_FILE", "dark_mode_session").strip()
+            if not session_value:
+                session_path = session_file if session_file.endswith(".session") else f"{session_file}.session"
+                if not os.path.exists(session_path):
+                    missing_vars.append("TELETHON_SESSION (or session file)")
+            if not self.private_group_id:
+                missing_vars.append("DARK_MODE_PRIVATE_GROUP_ID")
+            if not self.bot_b_id:
+                missing_vars.append("DARK_MODE_BOT_B_ID")
+
+        config_warning = ""
+        if missing_vars:
+            config_warning = "\n\n⚠️ <b>Missing Config:</b>\n" + "\n".join(f"  • <code>{v}</code>" for v in missing_vars)
+
         text = (
             "🌑 <b>Dark Mode — Control Center</b>\n"
             "━━━━━━━━━━━━━━━\n"
             f"Status  : {status_badge}\n"
             f"Bridge  : {bridge_badge}\n"
             "Access  : <i>Owner managed</i>"
+            + config_warning
         )
         if note:
             text = f"✅ <i>{html_lib.escape(note)}</i>\n\n{text}"
@@ -909,15 +983,15 @@ class DarkMode:
         uid = update.effective_user.id
         btns = await self.get_manage_buttons_for_user(uid)
         if not btns:
-            await self._screen(q, "📭 <b>Koi manageable button nahi mila.</b>\nNaya button banao:", InlineKeyboardMarkup([
-                [InlineKeyboardButton("🆕 Create new button", callback_data=f"dm:new:{request_id}")],
+            await self._screen(q, "📭 <b>Koi manageable folder nahi mila.</b>\nNaya folder banao:", InlineKeyboardMarkup([
+                [InlineKeyboardButton("🆕 Create new folder", callback_data=f"dm:new:{request_id}")],
             ]))
             return
         kb = []
         for b in btns[:30]:
-            kb.append([InlineKeyboardButton("🔘 " + (b.get("name") or f"Button {b.get('id')}")[:53], callback_data=f"dm:pick:{request_id}:{b['id']}")])
+            kb.append([InlineKeyboardButton("🔘 " + (b.get("name") or f"Folder {b.get('id')}")[:53], callback_data=f"dm:pick:{request_id}:{b['id']}")])
         kb.append([InlineKeyboardButton("↩️ Back", callback_data=f"dm:new:{request_id}")])
-        await self._screen(q, "📌 <b>Select a button:</b>", InlineKeyboardMarkup(kb))
+        await self._screen(q, "📌 <b>Select a folder:</b>", InlineKeyboardMarkup(kb))
 
     async def _validate_preview_owner(self, q, request_id: str) -> bool:
         preview = self.previews.get(request_id)
@@ -963,11 +1037,11 @@ class DarkMode:
         preview = self.previews.get(request_id)
         btn = await self.get_button_by_id(bid)
         if not btn:
-            await self._screen(q, "❌ Button not found.")
+            await self._screen(q, "❌ Folder not found.")
             return
         role = await self.get_user_role(preview.user_id)
         if not await self.can_add_files_to_button(preview.user_id, btn, role):
-            await self._screen(q, "🚫 Is button me add karne ki permission nahi hai.")
+            await self._screen(q, "🚫 Is folder me add karne ki permission nahi hai.")
             return
 
         file_info = dict(preview.file_info)
