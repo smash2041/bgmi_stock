@@ -158,16 +158,6 @@ async def init_db():
         created_by INTEGER,
         created_at TEXT
     )""")
-    await db.aexecute("""CREATE TABLE IF NOT EXISTS authorized_users (
-        user_id INTEGER PRIMARY KEY,
-        created_at TEXT
-    )""")
-    await db.aexecute("""CREATE TABLE IF NOT EXISTS banned_users (
-        user_id INTEGER PRIMARY KEY,
-        banned_by INTEGER,
-        reason TEXT,
-        created_at TEXT
-    )""")
     await db.aexecute("""CREATE TABLE IF NOT EXISTS access_keys (
         key TEXT PRIMARY KEY,
         is_used INTEGER DEFAULT 0,
@@ -258,12 +248,6 @@ CACHE = {
     "ts": 0
 }
 
-ACCESS_CACHE = {
-    "authorized_ids": set(),
-    "banned_ids": set(),
-    "ts": 0
-}
-
 BUTTON_CACHE = {
     "buttons": [],
     "by_id": {},
@@ -314,23 +298,7 @@ async def refresh_cache(force=False):
     except Exception as e:
         logging.error(f"cache refresh error {e}")
 
-async def refresh_access_cache(force=False):
-    now = time.time()
-    if not force and now - ACCESS_CACHE.get("ts",0) < 20:
-        return
-    try:
-        cur = await db.aexecute("SELECT user_id FROM authorized_users")
-        ACCESS_CACHE["authorized_ids"] = {int(r[0]) for r in cur.fetchall()}
-        cur = await db.aexecute("SELECT user_id FROM banned_users")
-        ACCESS_CACHE["banned_ids"] = {int(r[0]) for r in cur.fetchall()}
-        ACCESS_CACHE["ts"] = time.time()
-    except Exception as e:
-        logging.error(f"access cache refresh error {e}")
 
-def invalidate_access_cache():
-    ACCESS_CACHE["authorized_ids"] = set()
-    ACCESS_CACHE["banned_ids"] = set()
-    ACCESS_CACHE["ts"] = 0
 
 async def get_all_user_admins():
     await refresh_cache()
@@ -370,6 +338,8 @@ async def can_generate_keys(uid):
     except Exception as e:
         return False
 
+
+
 def get_uadmin_nickname(target_uid):
     try: target_uid = int(target_uid)
     except Exception as e: return ""
@@ -397,6 +367,25 @@ def display_button_name(btn):
     if is_locked_button(btn) and LOCK_EMOJI not in name:
         return f"{name} {LOCK_EMOJI}"
     return name
+
+def display_admin_button_name(btn):
+    name = display_button_name(btn)
+    vis = btn.get('visibility', 'all')
+    
+    SHORT_VIS = {
+        "all": "🌐",
+        "owner_only": "👑",
+        "coowner_owner": "👑C",
+        "uadmins_only": "👥",
+        "uadmins_coowner": "👥C",
+        "specific_uadmin": "👤",
+    }
+    
+    vis_emoji = SHORT_VIS.get(vis, "🌐")
+    # UAdmin ne public kiya ho toh 👥 dikhao, owner/co-admin ke liye 🌐 hi rahega
+    if vis == "all" and not is_owner_created_button(btn):
+        vis_emoji = "👥"
+    return f"[{vis_emoji}] {name}"
 
 def is_owner_created_button(btn):
     created_by = btn.get('created_by')
@@ -458,46 +447,19 @@ def clean_button_text(text: str) -> str:
 def is_owner(uid):
     return str(uid) == OWNER_ID
 
-async def is_banned(uid):
-    try:
-        await refresh_access_cache()
-        return int(uid) in ACCESS_CACHE["banned_ids"]
-    except Exception as e:
-        return False
-
-async def is_co_admin(uid):
-    if await is_banned(uid):
-        return False
-    await refresh_cache()
-    return int(uid) in CACHE["co_ids_set"]
-
-async def is_user_admin(uid):
-    if await is_banned(uid):
-        return False
-    await refresh_cache()
-    return int(uid) in CACHE["uadmin_ids_set"]
-
 async def is_authorized(uid):
     try:
         uid_int = int(uid)
-        await refresh_access_cache()
-        if uid_int in ACCESS_CACHE["banned_ids"]:
-            return False
         if is_owner(uid):
             return True
         await refresh_cache()
-        if uid_int in CACHE["co_ids_set"] or uid_int in CACHE["uadmin_ids_set"]:
-            return True
-        return uid_int in ACCESS_CACHE["authorized_ids"]
+        return uid_int in CACHE["co_ids_set"] or uid_int in CACHE["uadmin_ids_set"]
     except Exception as e:
         return False
 
 async def get_user_role(uid):
     try:
         uid_int = int(uid)
-        await refresh_access_cache()
-        if uid_int in ACCESS_CACHE["banned_ids"]:
-            return "banned"
         if is_owner(uid):
             return "owner"
         await refresh_cache()
@@ -505,29 +467,11 @@ async def get_user_role(uid):
             return "co_admin"
         if uid_int in CACHE["uadmin_ids_set"]:
             return "user_admin"
-        if uid_int in ACCESS_CACHE["authorized_ids"]:
-            return "normal_user"
         return "unauthorized"
     except Exception as e:
         return "unauthorized"
 
-async def ban_user(target_id, banned_by):
-    tid = int(target_id)
-    await db.aexecute("DELETE FROM co_admins WHERE user_id =?", (tid,))
-    await db.aexecute("DELETE FROM user_admins WHERE user_id =?", (tid,))
-    await db.aexecute("DELETE FROM authorized_users WHERE user_id =?", (tid,))
-    await db.aexecute("DELETE FROM user_states WHERE user_id =?", (tid,))
-    await db.aexecute(
-        "INSERT OR REPLACE INTO banned_users (user_id, banned_by, reason, created_at) VALUES (?,?,?,?)",
-        (tid, int(banned_by), "banned by owner", datetime.now(timezone.utc).isoformat())
-    )
-    invalidate_access_cache()
-    await refresh_cache(force=True)
 
-async def unban_user(target_id):
-    await db.aexecute("DELETE FROM banned_users WHERE user_id =?", (int(target_id),))
-    invalidate_access_cache()
-    await refresh_cache(force=True)
 
 async def get_user_state(uid):
     try:
@@ -555,13 +499,11 @@ async def clear_user_state(uid):
     try: await db.aexecute("DELETE FROM user_states WHERE user_id =?", (int(uid),))
     except Exception as e: pass
 
-def generate_key():
-    rand = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-    return f"KEY-{rand}"
-
 def generate_uadmin_key():
     rand = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
     return f"UADMIN-{rand}"
+
+
 
 async def auto_delete_message(bot, chat_id, message_id, delay=None):
     if delay is None:
@@ -1109,8 +1051,12 @@ async def refresh_button_pdf_backup(context, bid, btn=None):
     async with PDF_BUILD_SEMAPHORE:
         await _refresh_button_pdf_backup_impl(context, bid, btn)
 
-def build_inline_button(btn):
-    return InlineKeyboardButton(text=display_button_name(btn), callback_data=f"open_btn:{btn['id']}:0")
+def build_inline_button(btn, role="user"):
+    if role in ("owner", "co_admin", "user_admin"):
+        name = display_admin_button_name(btn)
+    else:
+        name = display_button_name(btn)
+    return InlineKeyboardButton(text=name, callback_data=f"open_btn:{btn['id']}:0")
 
 PER_PAGE = 15
 VIS_OPTIONS = [
@@ -1120,7 +1066,6 @@ VIS_OPTIONS = [
     ("👥 All UAdmins Only", "uadmins_only"),
     ("👥 UAdmins + Co-Owner", "uadmins_coowner"),
     ("👤 Specific UAdmin Only", "specific_uadmin"),
-    ("👥 Users + Owner Only", "users_owner_only"),
 ]
 VIS_LABELS = {val: name for name, val in VIS_OPTIONS}
 
@@ -1181,8 +1126,6 @@ def can_view_in_main_menu(uid, btn, role, user_admin_ids, uadmin_hidden_ids=None
         if vis in ("all", "uadmins_only", "uadmins_coowner"): return True
         if vis == "specific_uadmin": return int(uid) in get_button_visible_uadmin_ids(btn)
         return False
-    if role == "normal_user":
-        return vis in ("all", "users_owner_only")
     return False
 
 def can_access_button(uid, btn, role, user_admin_ids, uadmin_hidden_ids=None):
@@ -1197,12 +1140,6 @@ def can_access_button(uid, btn, role, user_admin_ids, uadmin_hidden_ids=None):
         vis = btn.get('visibility', 'all')
         if vis in ("all", "uadmins_only", "uadmins_coowner"): return True
         if vis == "specific_uadmin": return int(uid) in get_button_visible_uadmin_ids(btn)
-        return False
-    if role == "normal_user":
-        vis = btn.get('visibility', 'all')
-        if vis == "all": return True
-        if vis == "users_owner_only": return True
-        if str(vis).startswith("specific_uadmin"): return int(uid) in get_button_visible_uadmin_ids(btn)
         return False
     return False
 
@@ -1265,7 +1202,7 @@ async def can_edit_button(uid, btn, role):
     return False
 
 async def can_change_visibility(uid, btn, role):
-    if not btn or role == "user_admin": return False
+    if not btn: return False
     if not await can_open_manage_button(uid, btn, role) or is_locked_button(btn): return False
     if role == "owner": return True
     if role == "co_admin":
@@ -1274,7 +1211,18 @@ async def can_change_visibility(uid, btn, role):
             hidden_ids = await get_uadmin_hidden_id_set()
             return int(created_by) not in hidden_ids
         return await can_edit_button(uid, btn, role)
+    # user_admin: can only set their OWN button public (all) - not other visibility options
+    if role == "user_admin":
+        return btn.get('created_by') and int(btn.get('created_by')) == int(uid)
     return False
+
+async def can_uadmin_make_public(uid, btn, role):
+    """Check if a user_admin can set their own folder to public (all)."""
+    if role != "user_admin": return False
+    if not btn or is_locked_button(btn): return False
+    if not (btn.get('created_by') and int(btn.get('created_by')) == int(uid)): return False
+    # Only show the button if folder is NOT already public
+    return btn.get('visibility', 'all') != 'all'
 
 async def show_manage_button_menu(update, context, bid, role=None, back_callback="admin_manage_list"):
     q = update.callback_query
@@ -1288,19 +1236,22 @@ async def show_manage_button_menu(update, context, bid, role=None, back_callback
     kb = [[InlineKeyboardButton("\U0001F441 View Files / Data", callback_data=f"view_btn:{bid}:0")]]
     if is_locked_button(btn):
         if role == "owner":
-            kb.append([InlineKeyboardButton("\U0001F513 Unlock Button", callback_data=f"m_lock_toggle:{bid}")])
+            kb.append([InlineKeyboardButton("\U0001F513 Unlock Folder", callback_data=f"m_lock_toggle:{bid}")])
     else:
         if await can_add_files_to_button(uid, btn, role):
             kb.append([InlineKeyboardButton("\U0001F4E4 Add Files", callback_data=f"m_addfile:{bid}")])
         if await can_edit_button(uid, btn, role):
             kb.append([InlineKeyboardButton("\U0001F4C4 List/Delete Files", callback_data=f"m_listfiles:{bid}")])
-            if await can_change_visibility(uid, btn, role):
+            if await can_change_visibility(uid, btn, role) and role != "user_admin":
                 kb.append([InlineKeyboardButton("\U0001F441 Visibility", callback_data=f"m_vis:{bid}")])
-            kb.append([InlineKeyboardButton("\U0000274C Delete Button", callback_data=f"m_delbtn:{bid}")])
+            kb.append([InlineKeyboardButton("\U0000274C Delete Folder", callback_data=f"m_delbtn:{bid}")])
+        # UAdmin: show Make Public button for their own non-public folders
+        if await can_uadmin_make_public(uid, btn, role):
+            kb.append([InlineKeyboardButton("\U0001F310 Make Public (All can see)", callback_data=f"m_make_public:{bid}")])
         if role == "owner":
-            kb.append([InlineKeyboardButton(f"{LOCK_EMOJI} Lock Button", callback_data=f"m_lock_toggle:{bid}")])
+            kb.append([InlineKeyboardButton(f"{LOCK_EMOJI} Lock Folder", callback_data=f"m_lock_toggle:{bid}")])
     kb.append([InlineKeyboardButton("Back", callback_data=back_callback)])
-    await safe_edit(q, f"Visibility: {format_visibility_mode(btn)}\nManage Button: {display_button_name(btn)} (ID {bid})", InlineKeyboardMarkup(kb))
+    await safe_edit(q, f"Visibility: {format_visibility_mode(btn)}\nManage Folder: {display_admin_button_name(btn)} (ID {bid})", InlineKeyboardMarkup(kb))
 # ---------------- TEMP MESSAGE HELPERS ----------------
 
 async def _send_temp(bot, chat_id, text):
@@ -1481,9 +1432,7 @@ dark_mode_controller = dark_mode.DarkMode(
 async def show_main_menu(update, context, page=0):
     uid = update.effective_user.id
     role = await get_user_role(uid)
-    if role == "banned":
-        await context.bot.send_message(update.effective_chat.id, "🚫 You are banned by owner.")
-        return
+
 
     buttons, total = await get_buttons_paginated_for_user(uid, page, role)
     total_pages = max(1, (total + PER_PAGE - 1)//PER_PAGE)
@@ -1491,7 +1440,7 @@ async def show_main_menu(update, context, page=0):
     inline_rows = []
     r = []
     for b in buttons:
-        r.append(build_inline_button(b))
+        r.append(build_inline_button(b, role))
         if len(r) == 2:
             inline_rows.append(r)
             r = []
@@ -1503,10 +1452,10 @@ async def show_main_menu(update, context, page=0):
     if pag_row: inline_rows.append(pag_row)
 
     if role in ("owner", "co_admin", "user_admin"):
-        inline_rows.append([InlineKeyboardButton("➕ Create New Button", callback_data="admin_add_button")])
+        inline_rows.append([InlineKeyboardButton("➕ Create New Folder", callback_data="admin_add_button")])
         inline_rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel")])
 
-    text = f"📂 Main Menu (Page {page+1}/{total_pages}) - {total} buttons\nSelect any button:"
+    text = f"📂 Main Menu (Page {page+1}/{total_pages}) - {total} folders\nSelect any folder:"
 
     try:
         if update.callback_query:
@@ -1519,37 +1468,34 @@ async def show_main_menu(update, context, page=0):
 async def show_admin_panel(update, context):
     uid = update.effective_user.id
     role = await get_user_role(uid)
-    if role == "banned":
-        await context.bot.send_message(update.effective_chat.id, "🚫 Banned")
-        return
+
 
     if role == "owner":
         kb = [
-            [InlineKeyboardButton("🔑 Gen Normal Key", callback_data="admin_gen_key"), InlineKeyboardButton("👑 Gen UAdmin Key", callback_data="admin_gen_uadmin_key")],
-            [InlineKeyboardButton("📋 List Keys", callback_data="admin_list_keys"), InlineKeyboardButton("➕ Add Button", callback_data="admin_add_button")],
-            [InlineKeyboardButton("🗂 Manage Buttons", callback_data="admin_manage_list")],
+            [InlineKeyboardButton("👑 Gen UAdmin Key", callback_data="admin_gen_uadmin_key"), InlineKeyboardButton("📋 List Keys", callback_data="admin_list_keys")],
+            [InlineKeyboardButton("➕ Add Folder", callback_data="admin_add_button")],
+            [InlineKeyboardButton("🗂 Manage Folders", callback_data="admin_manage_list")],
             [InlineKeyboardButton("👥 Add Co-Admin", callback_data="admin_add_coadmin"), InlineKeyboardButton("📜 List Co-Admins", callback_data="admin_list_coadmin")],
             [InlineKeyboardButton("👥 User Admins List", callback_data="admin_list_uadmins")],
             [InlineKeyboardButton(await dark_mode_controller.owner_panel_label(), callback_data="dm:panel"), InlineKeyboardButton("Dark Mode Commands", callback_data="dm:perms")],
-            [InlineKeyboardButton("🚫 Ban User", callback_data="owner_ban"), InlineKeyboardButton("✅ Unban User", callback_data="owner_unban")],
             [InlineKeyboardButton("🔄 Rebuild PDF (Single)", callback_data="rebuild_single_prompt"), InlineKeyboardButton("🔄 Rebuild All PDFs", callback_data="rebuild_all_pdfs")],
-            [InlineKeyboardButton("📜 Banned List", callback_data="owner_banned_list"), InlineKeyboardButton("♻ Shutdown / Restart", callback_data="owner_shutdown")],
+            [InlineKeyboardButton("♻ Shutdown / Restart", callback_data="owner_shutdown")],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="main_page:0")]
         ]
     elif role == "co_admin":
         kb = [
-            [InlineKeyboardButton("➕ Add Button", callback_data="admin_add_button")],
-            [InlineKeyboardButton("🗂 Manage Buttons", callback_data="admin_manage_list")],
+            [InlineKeyboardButton("➕ Add Folder", callback_data="admin_add_button")],
+            [InlineKeyboardButton("🗂 Manage Folders", callback_data="admin_manage_list")],
             [InlineKeyboardButton("👥 User Admins List", callback_data="admin_list_uadmins")],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="main_page:0")]
         ]
         if await can_generate_keys(uid):
-            kb.insert(0, [InlineKeyboardButton("🔑 Gen Normal Key", callback_data="admin_gen_key"), InlineKeyboardButton("👑 Gen UAdmin Key", callback_data="admin_gen_uadmin_key")])
+            kb.insert(0, [InlineKeyboardButton("👑 Gen UAdmin Key", callback_data="admin_gen_uadmin_key")])
             kb.insert(1, [InlineKeyboardButton("📋 List Keys", callback_data="admin_list_keys")])
     elif role == "user_admin":
         kb = [
-            [InlineKeyboardButton("➕ Add Button (My Partition)", callback_data="admin_add_button")],
-            [InlineKeyboardButton("🗂 My Buttons", callback_data="admin_manage_list")],
+            [InlineKeyboardButton("➕ Add Folder (My Partition)", callback_data="admin_add_button")],
+            [InlineKeyboardButton("🗂 My Folders", callback_data="admin_manage_list")],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="main_page:0")]
         ]
     else:
@@ -1566,15 +1512,12 @@ async def show_admin_panel(update, context):
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     clear_user_button_locks(uid)
-    if await is_banned(uid):
-        await update.effective_message.reply_text("🚫 You are banned by owner.")
-        return
     if await is_authorized(uid):
         await clear_user_state(uid)
         await show_main_menu(update, context, 0)
     else:
         await set_user_state(uid, "awaiting_access_key", {})
-        await update.effective_message.reply_text("🔐 Welcome! Send Access Key\nKEY-XXXX / UADMIN-XXXX")
+        await update.effective_message.reply_text("🔐 Welcome! Send Access Key\nUADMIN-XXXX")
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1650,7 +1593,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await db.aexecute("INSERT INTO buttons (name, visibility, btn_type, created_by) VALUES (?,?, 'callback',?)", (st['data']['name'], vis, int(uid)))
                 invalidate_button_cache()
-                await safe_edit(q, f"✅ Button '{st['data']['name']}' created! Vis: {vis}")
+                await safe_edit(q, f"✅ Folder '{st['data']['name']}' created! Vis: {vis}")
             except Exception as e:
                 await safe_edit(q, f"❌ Exists: {e}")
             await clear_user_state(uid)
@@ -1701,12 +1644,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_main_menu(update, context, 0)
 
         elif data.startswith("admin_"):
-            if data == "admin_gen_key":
-                if not await can_generate_keys(uid): return
-                k = generate_key()
-                await db.aexecute("INSERT INTO access_keys (key, is_used, key_type, created_at, generated_by) VALUES (?, 0, 'normal',?,?)", (k, datetime.now(timezone.utc).isoformat(), int(uid)))
-                await safe_edit(q, f"✅ Normal Key:\n`{k}`", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
-            elif data == "admin_gen_uadmin_key":
+            if data == "admin_gen_uadmin_key":
                 if not await can_generate_keys(uid): return
                 k = generate_uadmin_key()
                 await set_user_state(uid, "awaiting_uadmin_nickname", {"key": k})
@@ -1718,16 +1656,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_edit(q, txt, InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
             elif data == "admin_add_button":
                 await set_user_state(uid, "awaiting_new_button_name", {})
-                await safe_edit(q, "📝 Send new button NAME:")
+                await safe_edit(q, "📝 Send new folder NAME:")
             elif data == "admin_manage_list":
                 btns = await get_manage_buttons_for_user(uid)
                 if not btns:
-                    if role == "owner": await safe_edit(q, "Owner ke apne buttons nahi hai. UAdmins ke buttons dekhne ke liye User Admins List me jao.", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
-                    else: await safe_edit(q, "No buttons", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
+                    if role == "owner": await safe_edit(q, "Owner ke apne folders nahi hai. UAdmins ke folders dekhne ke liye User Admins List me jao.", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
+                    else: await safe_edit(q, "No folders", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
                     return
-                rows = [[InlineKeyboardButton(display_button_name(b), callback_data=f"manage_btn:{b['id']}")] for b in btns[:30]]
+                rows = [[InlineKeyboardButton(display_admin_button_name(b), callback_data=f"manage_btn:{b['id']}")] for b in btns[:30]]
                 rows.append([InlineKeyboardButton("Back", callback_data="admin_panel")])
-                await safe_edit(q, "🗂 Your Buttons (Partition):", InlineKeyboardMarkup(rows))
+                await safe_edit(q, "🗂 Your Folders (Partition):", InlineKeyboardMarkup(rows))
             elif data == "admin_add_coadmin":
                 if not is_owner(uid): return
                 await set_user_state(uid, "awaiting_coadmin_id", {})
@@ -1769,28 +1707,46 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             hide_flag = int(r[2] or 0)
             kb = [
-                [InlineKeyboardButton("📂 View Buttons (His Partition)", callback_data=f"uadmin_view_buttons:{tid}")],
+                [InlineKeyboardButton("📂 View Folders (His Partition)", callback_data=f"uadmin_view_buttons:{tid}")],
                 [InlineKeyboardButton("✏ Set Nickname", callback_data=f"uadmin_set_nick:{tid}")],
             ]
             extra_line = ""
             if role == "owner":
                 hide_label = "👁 Show to Co-Owners" if hide_flag else "🙈 Hide from Co-Owners"
                 kb.append([InlineKeyboardButton("⬆ Promote to Co-Admin", callback_data=f"uadmin_promote:{tid}")])
-                kb.append([InlineKeyboardButton("⬇ Demote to Normal User", callback_data=f"uadmin_demote_user:{tid}")])
                 kb.append([InlineKeyboardButton(hide_label, callback_data=f"uadmin_hide_toggle:{tid}")])
-                kb.append([InlineKeyboardButton("🚫 Ban / Delete", callback_data=f"uadmin_del:{tid}")])
+                kb.append([InlineKeyboardButton("🚫 Revoke Access", callback_data=f"uadmin_revoke:{tid}")])
+                kb.append([InlineKeyboardButton("☠️ Kick & Delete Data", callback_data=f"uadmin_kick_prompt:{tid}")])
                 extra_line = "\n🙈 Hidden from Co-Owners" if hide_flag else ""
             kb.append([InlineKeyboardButton("Back", callback_data="admin_list_uadmins")])
             await safe_edit(q, f"👤 UAdmin: {r[0]}\nID: {tid}\nBy: {r[1]}{extra_line}", InlineKeyboardMarkup(kb))
 
-        elif data.startswith("uadmin_demote_user:"):
+        elif data.startswith("uadmin_revoke:"):
             if not is_owner(uid): return
             tid = int(data.split(":")[1])
             await db.aexecute("DELETE FROM user_admins WHERE user_id =?", (tid,))
-            await db.aexecute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)", (tid, datetime.now(timezone.utc).isoformat()))
-            invalidate_access_cache()
+            await db.aexecute("DELETE FROM user_states WHERE user_id =?", (tid,))
             await refresh_cache(force=True)
-            await safe_edit(q, f"✅ UAdmin {tid} demoted to Normal User", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_uadmins")]]))
+            await safe_edit(q, f"✅ UAdmin {tid} access revoked (data safe).", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_uadmins")]]))
+
+        elif data.startswith("uadmin_kick_prompt:"):
+            if not is_owner(uid): return
+            tid = int(data.split(":")[1])
+            kb = [
+                [InlineKeyboardButton("✅ Confirm Kick", callback_data=f"uadmin_kick_confirm:{tid}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"uadmin_view:{tid}")]
+            ]
+            await safe_edit(q, f"⚠ ARE YOU SURE?\nUser {tid} ka access aur saare folders delete ho jayenge permanently!", InlineKeyboardMarkup(kb))
+
+        elif data.startswith("uadmin_kick_confirm:"):
+            if not is_owner(uid): return
+            tid = int(data.split(":")[1])
+            await db.aexecute("DELETE FROM buttons WHERE created_by =?", (tid,))
+            await db.aexecute("DELETE FROM user_admins WHERE user_id =?", (tid,))
+            await db.aexecute("DELETE FROM user_states WHERE user_id =?", (tid,))
+            invalidate_button_cache()
+            await refresh_cache(force=True)
+            await safe_edit(q, f"☠️ UAdmin {tid} and their data completely deleted.", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_uadmins")]]))
 
         elif data.startswith("coadmin_view:"):
             if not is_owner(uid): return
@@ -1802,12 +1758,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb = [
                 [InlineKeyboardButton(keygen_label, callback_data=f"coadmin_keygen_toggle:{tid}")],
                 [InlineKeyboardButton("⬇ Demote to UAdmin", callback_data=f"coadmin_demote:{tid}")],
-                [InlineKeyboardButton("⬇⬇ Demote to Normal User", callback_data=f"coadmin_demote_user:{tid}")],
-                [InlineKeyboardButton("🚫 Ban / Remove", callback_data=f"coadmin_del:{tid}")],
+                [InlineKeyboardButton("🚫 Revoke Access", callback_data=f"coadmin_revoke:{tid}")],
+                [InlineKeyboardButton("☠️ Kick & Delete Data", callback_data=f"coadmin_kick_prompt:{tid}")],
                 [InlineKeyboardButton("Back", callback_data="admin_list_coadmin")]
             ]
             keygen_txt = "Allowed ✅" if keygen_flag else "Not Allowed ❌"
-            await safe_edit(q, f"👤 Co-Admin ID: {tid}\nKey Generation: {keygen_txt}\nOwner can demote or ban even co-owner", InlineKeyboardMarkup(kb))
+            await safe_edit(q, f"👤 Co-Admin ID: {tid}\nKey Generation: {keygen_txt}\nOwner can demote or remove co-owner", InlineKeyboardMarkup(kb))
 
         elif data.startswith("uadmin_view_buttons:"):
             tid = int(data.split(":")[1])
@@ -1819,29 +1775,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur = await db.aexecute("SELECT id, name, visibility, locked FROM buttons WHERE created_by =?", (tid,))
             rows = cur.fetchall()
             if not rows:
-                await safe_edit(q, f"No buttons by UAdmin {tid}", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"uadmin_view:{tid}")]]))
+                await safe_edit(q, f"No folders by UAdmin {tid}", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"uadmin_view:{tid}")]]))
                 return
             kb = [[InlineKeyboardButton(f"{display_button_name({'name': r[1], 'locked': r[3]})} [{r[2]}]", callback_data=f"manage_btn:{r[0]}")] for r in rows[:30]]
             kb.append([InlineKeyboardButton("Back", callback_data=f"uadmin_view:{tid}")])
-            await safe_edit(q, f"Buttons by UAdmin {tid} - Owner view (click to see data):", InlineKeyboardMarkup(kb))
+            await safe_edit(q, f"Folders by UAdmin {tid} - Owner view (click to see data):", InlineKeyboardMarkup(kb))
 
         elif data.startswith("uadmin_set_nick:"):
             await set_user_state(uid, "awaiting_set_nickname", {"target_id": int(data.split(":")[1])})
             await safe_edit(q, f"✏ Send new nickname for ID {data.split(':')[1]}:")
 
-        elif data.startswith("uadmin_del:"):
-            if not is_owner(uid): return
-            tid = int(data.split(":")[1])
-            await ban_user(tid, uid)
-            await safe_edit(q, f"✅ UAdmin {tid} banned & all access removed", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_uadmins")]]))
+
 
         elif data.startswith("uadmin_promote:"):
             if not is_owner(uid): return
             tid = int(data.split(":")[1])
             await db.aexecute("DELETE FROM user_admins WHERE user_id =?", (tid,))
             await db.aexecute("INSERT OR REPLACE INTO co_admins (user_id, added_by, created_at) VALUES (?,?,?)", (tid, int(uid), datetime.now(timezone.utc).isoformat()))
-            await db.aexecute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)", (tid, datetime.now(timezone.utc).isoformat()))
-            invalidate_access_cache()
             await refresh_cache(force=True)
             await safe_edit(q, f"✅ Promoted {tid} to Co-Admin", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_uadmins")]]))
 
@@ -1857,16 +1807,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = "hidden from" if new_flag else "visible to"
             await safe_edit(q, f"✅ UAdmin {tid} is now {status} Co-Owners", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"uadmin_view:{tid}")]]))
 
-        elif data.startswith("coadmin_demote:"):
-            if not is_owner(uid): return
-            tid = int(data.split(":")[1])
-            await db.aexecute("DELETE FROM co_admins WHERE user_id =?", (tid,))
-            await db.aexecute("INSERT OR REPLACE INTO user_admins (user_id, nickname, created_by, created_at) VALUES (?,?,?,?)", (tid, f"UAdmin-{tid}", int(uid), datetime.now(timezone.utc).isoformat()))
-            await db.aexecute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)", (tid, datetime.now(timezone.utc).isoformat()))
-            invalidate_access_cache()
-            await refresh_cache(force=True)
-            await safe_edit(q, f"✅ Demoted {tid} to UAdmin", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_coadmin")]]))
-
         elif data.startswith("coadmin_keygen_toggle:"):
             if not is_owner(uid): return
             tid = int(data.split(":")[1])
@@ -1879,33 +1819,42 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = "allowed" if new_flag else "revoked"
             await safe_edit(q, f"✅ Key generation {status} for Co-Admin {tid}", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"coadmin_view:{tid}")]]))
 
-        elif data.startswith("coadmin_demote_user:"):
+        elif data.startswith("coadmin_demote:"):
             if not is_owner(uid): return
             tid = int(data.split(":")[1])
             await db.aexecute("DELETE FROM co_admins WHERE user_id =?", (tid,))
-            await db.aexecute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)", (tid, datetime.now(timezone.utc).isoformat()))
-            invalidate_access_cache()
+            await db.aexecute("INSERT OR REPLACE INTO user_admins (user_id, nickname, created_by, created_at) VALUES (?,?,?,?)", (tid, f"UAdmin-{tid}", int(uid), datetime.now(timezone.utc).isoformat()))
             await refresh_cache(force=True)
-            await safe_edit(q, f"✅ Co-Admin {tid} demoted to Normal User", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_coadmin")]]))
+            await safe_edit(q, f"✅ Demoted {tid} to UAdmin", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_coadmin")]]))
 
-        elif data.startswith("coadmin_del:"):
+        elif data.startswith("coadmin_revoke:"):
             if not is_owner(uid): return
             tid = int(data.split(":")[1])
-            await ban_user(tid, uid)
-            await safe_edit(q, f"✅ Co-Admin {tid} banned & removed", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_coadmin")]]))
+            await db.aexecute("DELETE FROM co_admins WHERE user_id =?", (tid,))
+            await db.aexecute("DELETE FROM user_states WHERE user_id =?", (tid,))
+            await refresh_cache(force=True)
+            await safe_edit(q, f"✅ Co-Admin {tid} access revoked (data safe).", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_coadmin")]]))
 
-        elif data == "owner_ban":
+        elif data.startswith("coadmin_kick_prompt:"):
             if not is_owner(uid): return
-            await set_user_state(uid, "awaiting_ban_id", {})
-            await safe_edit(q, "🚫 Send User ID to BAN:")
-        elif data == "owner_unban":
+            tid = int(data.split(":")[1])
+            kb = [
+                [InlineKeyboardButton("✅ Confirm Kick", callback_data=f"coadmin_kick_confirm:{tid}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"coadmin_view:{tid}")]
+            ]
+            await safe_edit(q, f"⚠ ARE YOU SURE?\nCo-Admin {tid} ka access aur saare folders delete ho jayenge permanently!", InlineKeyboardMarkup(kb))
+
+        elif data.startswith("coadmin_kick_confirm:"):
             if not is_owner(uid): return
-            await set_user_state(uid, "awaiting_unban_id", {})
-            await safe_edit(q, "✅ Send User ID to UNBAN:")
-        elif data == "owner_banned_list":
-            cur = await db.aexecute("SELECT user_id, banned_by FROM banned_users LIMIT 30")
-            txt = "🚫 Banned Users:\n" + "\n".join([f"ID: {r[0]} by {r[1]}" for r in cur.fetchall()]) or "None"
-            await safe_edit(q, txt, InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
+            tid = int(data.split(":")[1])
+            await db.aexecute("DELETE FROM buttons WHERE created_by =?", (tid,))
+            await db.aexecute("DELETE FROM co_admins WHERE user_id =?", (tid,))
+            await db.aexecute("DELETE FROM user_states WHERE user_id =?", (tid,))
+            invalidate_button_cache()
+            await refresh_cache(force=True)
+            await safe_edit(q, f"☠️ Co-Admin {tid} and their data completely deleted.", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_list_coadmin")]]))
+
+        
         elif data == "owner_shutdown":
             if not is_owner(uid): return
             await safe_edit(q, "♻ Bot shutting down safely... Render will auto-restart.")
@@ -1917,27 +1866,71 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not BACKUP_CHANNEL_ID:
                 await safe_edit(q, "❌ BACKUP_CHANNEL_ID not set hai.", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
                 return
+            cur = await db.aexecute("SELECT COUNT(*) FROM buttons")
+            total = cur.fetchone()[0]
+            await safe_edit(q, f"⚠️ Kya aap sure hain?\n\nYe {total} buttons ka PDF rebuild karega.\nIs mein time lag sakta hai.", InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Haan, Rebuild Karo", callback_data="rebuild_all_confirm")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]
+            ]))
+
+        elif data == "rebuild_all_confirm":
+            if not is_owner(uid): return
+            if not BACKUP_CHANNEL_ID:
+                await safe_edit(q, "❌ BACKUP_CHANNEL_ID not set hai.", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
+                return
             cur = await db.aexecute("SELECT id, name, visibility, created_by, visible_to_user_id, locked, visible_to_user_ids FROM buttons ORDER BY id")
             rows = cur.fetchall()
             buttons = [
                 {"id": r[0], "name": r[1], "visibility": r[2], "created_by": r[3], "visible_to_user_id": r[4], "locked": r[5], "visible_to_user_ids": r[6]}
                 for r in rows
             ]
-            await safe_edit(q, f"🔄 Rebuild start: {len(buttons)} buttons...")
+            total = len(buttons)
+            await safe_edit(q, f"🔄 Rebuild start: 0/{total} buttons...")
             done = 0
+            success = 0
+            failed = 0
             for btn in buttons:
-                await refresh_button_pdf_backup(context, int(btn["id"]), btn)
+                try:
+                    await refresh_button_pdf_backup(context, int(btn["id"]), btn)
+                    success += 1
+                except Exception:
+                    failed += 1
                 done += 1
+                if done % 3 == 0 or done == total:
+                    try: await q.message.edit_text(f"🔄 Rebuilding... {done}/{total} done\n✅ {success} success | ❌ {failed} failed")
+                    except Exception: pass
                 await asyncio.sleep(0.2)
-            await q.message.edit_text(f"✅ Rebuild done: {done} buttons checked", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
+            await q.message.edit_text(f"✅ Rebuild Complete!\n\n📊 Total: {total}\n✅ Success: {success}\n❌ Failed: {failed}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
         elif data == "rebuild_single_prompt":
             if not is_owner(uid): return
             if not BACKUP_CHANNEL_ID:
                 await safe_edit(q, "❌ BACKUP_CHANNEL_ID not set hai.", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_panel")]]))
                 return
-            await set_user_state(uid, "awaiting_rebuild_bid", {})
-            await safe_edit(q, "🔄 Button ID bhejo jiska PDF rebuild karna hai:", InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]]))
+            cur = await db.aexecute("SELECT id, name FROM buttons ORDER BY id")
+            btn_rows = cur.fetchall()
+            if not btn_rows:
+                await safe_edit(q, "❌ Koi folder nahi mila.", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+                return
+            kb = [[InlineKeyboardButton(f"📄 {r[1]} (ID:{r[0]})", callback_data=f"rebuild_pick:{r[0]}")] for r in btn_rows[:30]]
+            if len(btn_rows) > 30:
+                kb.append([InlineKeyboardButton(f"... aur {len(btn_rows)-30} folders", callback_data="rebuild_single_prompt")])
+            kb.append([InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")])
+            await safe_edit(q, "🔄 Kaunsa folder rebuild karna hai? Tap karo:", InlineKeyboardMarkup(kb))
+
+        elif data.startswith("rebuild_pick:"):
+            if not is_owner(uid): return
+            bid = int(data.split(":")[1])
+            btn = await get_button_by_id(bid)
+            if not btn:
+                await safe_edit(q, "❌ Folder nahi mila.", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+                return
+            await safe_edit(q, f"🔄 Rebuilding PDF for: {btn.get('name')}...")
+            try:
+                await refresh_button_pdf_backup(context, bid, btn)
+                await q.message.edit_text(f"✅ PDF rebuild done for: {btn.get('name')}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Rebuild Another", callback_data="rebuild_single_prompt"), InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+            except Exception as e:
+                await q.message.edit_text(f"❌ Rebuild failed for: {btn.get('name')}\nError: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data=f"rebuild_pick:{bid}"), InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
 
         elif data.startswith("manage_btn:"):
@@ -1954,7 +1947,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             invalidate_button_cache()
             btn["locked"] = new_locked
             status = "locked" if new_locked else "unlocked"
-            await safe_edit(q, f"Button {display_button_name(btn)} {status}", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
+            await safe_edit(q, f"Folder {display_admin_button_name(btn)} {status}", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
 
         elif data.startswith("m_addfile:"):
             bid = int(data.split(":")[1])
@@ -2041,6 +2034,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await refresh_button_pdf_backup(context, bid, btn)
             await safe_edit(q, "Deleted", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
 
+        elif data.startswith("m_make_public:"):
+            bid = int(data.split(":")[1])
+            btn = await get_button_by_id(bid)
+            if not await can_uadmin_make_public(uid, btn, role):
+                await safe_edit(q, "❌ Not allowed")
+                return
+            await db.aexecute("UPDATE buttons SET visibility = 'all', visible_to_user_id = NULL, visible_to_user_ids = NULL WHERE id =?", (bid,))
+            invalidate_button_cache()
+            await safe_edit(q, f"✅ Folder is now Public! Sab uadmins dekh sakte hai.", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
+
         elif data.startswith("m_delbtn:"):
             bid = int(data.split(":")[1])
             btn = await get_button_by_id(bid)
@@ -2054,7 +2057,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data.startswith("m_vis:"):
             if role == "user_admin":
-                await safe_edit(q, "❌ UAdmin ko visibility change nahi milega")
+                await safe_edit(q, "❌ UAdmin sirf 'Make Public' button use karo")
                 return
             bid = int(data.split(":")[1])
             btn = await get_button_by_id(bid)
@@ -2133,17 +2136,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(q, f"Vis -> Specific UAdmin(s): {len(selected)} selected", InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"manage_btn:{bid}")]]))
 
     finally:
-        # CLICK_GUARD is time-based (self-expiring after CLICK_GUARD_WINDOW) so no
-        # explicit release task is needed here anymore - one less scheduled coroutine per click.
         pass
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = (update.effective_message.text or "").strip()
-    if await is_banned(uid):
-        await update.effective_message.reply_text("🚫 You are banned")
-        return
 
     state_obj = await get_user_state(uid)
     state = state_obj['state'] if state_obj else None
@@ -2156,8 +2154,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if r:
             is_uadmin_key = key_input.startswith("UADMIN-") or r[2] == 'uadmin'
             await db.aexecute("UPDATE access_keys SET is_used = 1, used_by =? WHERE key =?", (int(uid), key_input))
-            await db.aexecute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)", (int(uid), datetime.now(timezone.utc).isoformat()))
-            invalidate_access_cache()
             if is_uadmin_key:
                 await db.aexecute("INSERT OR REPLACE INTO user_admins (user_id, nickname, created_by, created_at) VALUES (?,?,?,?)", (int(uid), r[1] or f"UAdmin-{uid}", int(OWNER_ID), datetime.now(timezone.utc).isoformat()))
                 await refresh_cache(force=True)
@@ -2165,15 +2161,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.effective_message.reply_text(f"✅ UAdmin Granted Nick:{r[1]}")
             else:
                 await clear_user_state(uid)
-                await update.effective_message.reply_text("✅ Access granted!")
+                await update.effective_message.reply_text("✅ Access granted (UAdmin fallback)!")
+                await db.aexecute("INSERT OR REPLACE INTO user_admins (user_id, nickname, created_by, created_at) VALUES (?,?,?,?)", (int(uid), f"UAdmin-{uid}", int(OWNER_ID), datetime.now(timezone.utc).isoformat()))
+                await refresh_cache(force=True)
             await show_main_menu(update, context, 0)
         else:
             await update.effective_message.reply_text("❌ Invalid key")
         return
 
     if not await is_authorized(uid):
-        await set_user_state(uid, "awaiting_access_key", {})
-        await update.effective_message.reply_text("🔐 Send Access Key")
+        await update.effective_message.reply_text("❌ Access denied. Contact admin.")
         return
 
     if await dark_mode_controller.handle_text_state(update, context, state, sdata): return
@@ -2200,7 +2197,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await db.aexecute("INSERT INTO buttons (name, visibility, btn_type, created_by, visible_to_user_id) VALUES (?, 'specific_uadmin', 'callback',?,?)", (text, int(uid), int(uid)))
                 invalidate_button_cache()
-                await update.effective_message.reply_text(f"✅ Button '{text}' created in your private partition!")
+                await update.effective_message.reply_text(f"✅ Folder '{text}' created in your private partition!")
             except Exception as e:
                 await update.effective_message.reply_text(f"❌ Exists: {e}")
             await clear_user_state(uid)
@@ -2216,57 +2213,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             nid = int(re.search(r'\d+', text).group())
             await db.aexecute("INSERT OR REPLACE INTO co_admins (user_id, added_by, created_at) VALUES (?,?,?)", (nid, int(uid), datetime.now(timezone.utc).isoformat()))
-            await db.aexecute("INSERT OR IGNORE INTO authorized_users (user_id, created_at) VALUES (?,?)", (nid, datetime.now(timezone.utc).isoformat()))
-            invalidate_access_cache()
             await refresh_cache(force=True)
             await update.effective_message.reply_text(f"✅ Co-Admin {nid} added")
         except Exception as e:
             await update.effective_message.reply_text(f"Error: {e}")
-        await clear_user_state(uid)
-        return
-
-    if state == "awaiting_ban_id":
-        if not is_owner(uid):
-            await clear_user_state(uid)
-            return
-        try:
-            tid = int(re.search(r'\d+', text).group())
-            await ban_user(tid, uid)
-            await update.effective_message.reply_text(f"✅ Banned {tid} - full access removed")
-        except Exception as e:
-            await update.effective_message.reply_text(f"Error: {e}")
-        await clear_user_state(uid)
-        return
-
-    if state == "awaiting_unban_id":
-        if not is_owner(uid):
-            await clear_user_state(uid)
-            return
-        try:
-            tid = int(re.search(r'\d+', text).group())
-            await unban_user(tid)
-            await update.effective_message.reply_text(f"✅ Unbanned {tid}")
-        except Exception as e:
-            await update.effective_message.reply_text(f"Error: {e}")
-        await clear_user_state(uid)
-        return
-
-    if state == "awaiting_rebuild_bid":
-        if not is_owner(uid):
-            await clear_user_state(uid)
-            return
-        try:
-            bid = int(re.search(r'\d+', text).group())
-        except Exception:
-            await update.effective_message.reply_text("❌ Button ID number mein bhejo. Example: 12")
-            return
-        btn = await get_button_by_id(bid)
-        if not btn:
-            await update.effective_message.reply_text("❌ Button nahi mila.")
-            await clear_user_state(uid)
-            return
-        await refresh_button_pdf_backup(context, bid, btn)
-        await update.effective_message.reply_text(f"✅ PDF rebuild checked for: {btn.get('name')}")
         await clear_user_state(uid)
         return
 
@@ -2396,9 +2346,6 @@ async def dark_mode_command_handler(update: Update, context: ContextTypes.DEFAUL
 async def rebuildpdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     role = await get_user_role(uid)
-    if role == "banned":
-        await update.effective_message.reply_text("ðŸš« You are banned by owner.")
-        return
     if not BACKUP_CHANNEL_ID:
         await update.effective_message.reply_text("BACKUP_CHANNEL_ID not set hai.")
         return
@@ -2428,11 +2375,11 @@ async def rebuildpdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     try: bid = int(args[0])
     except Exception as e:
-        await update.effective_message.reply_text("Button id number me bhejo. Example: /rebuildpdf 12")
+        await update.effective_message.reply_text("Folder id number me bhejo. Example: /rebuildpdf 12")
         return
     btn = await get_button_by_id(bid)
     if not btn:
-        await update.effective_message.reply_text("Button nahi mila.")
+        await update.effective_message.reply_text("Folder nahi mila.")
         return
     if not await can_open_manage_button(uid, btn, role):
         await update.effective_message.reply_text("Is button ke liye permission nahi hai.")
@@ -2474,7 +2421,6 @@ async def ram_watcher():
                 BUTTON_CACHE["name_map"] = {}
                 BUTTON_CACHE["ts"] = 0
                 CACHE["ts"] = 0
-                ACCESS_CACHE["ts"] = 0
                 gc.collect()
                 logging.info(f"RAM Watcher cleaned, RAM was {ram_mb}MB")
         except Exception as e:
